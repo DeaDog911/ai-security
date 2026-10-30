@@ -1,0 +1,13 @@
+# PyTorch ставится отдельно скриптом scripts/setup_env.ps1 (ROCm-колёса AMD или CPU-сборка).
+# Python 3.12.
+numpy>=2.0,<2.4
+pandas>=2.2,<3.0
+pyarrow>=17
+scipy>=1.13
+scikit-learn>=1.5
+matplotlib>=3.9
+cleanlab>=2.7
+datasketch>=1.6
+tqdm>=4.66
+jupyter>=1.1
+ipykernel>=6.29
