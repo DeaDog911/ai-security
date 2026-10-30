@@ -1,0 +1,30 @@
+﻿признак,тип,преобразование
+square_footage,числовой,log
+height,числовой,log
+du_changed,числовой,slog
+adu_changed,числовой,slog
+lat,числовой,none
+lon,числовой,none
+issue_year,числовой,none
+issue_month,числовой,none
+issue_dow,числовой,none
+issue_doy,числовой,none
+days_to_issue,числовой,log
+desc_len,числовой,log
+PERMIT_TYPE,категориальный,"5 категорий (вкл. MISSING, OTHER)"
+PERMIT_SUB_TYPE,категориальный,"5 категорий (вкл. MISSING, OTHER)"
+USE_DESC,категориальный,"228 категорий (вкл. MISSING, OTHER)"
+CONSTRUCTION,категориальный,"18 категорий (вкл. MISSING, OTHER)"
+Business Unit,категориальный,"7 категорий (вкл. MISSING, OTHER)"
+ZONE,категориальный,"904 категорий (вкл. MISSING, OTHER)"
+zone_base,категориальный,"227 категорий (вкл. MISSING, OTHER)"
+ZIP_CODE,категориальный,"125 категорий (вкл. MISSING, OTHER)"
+CT,категориальный,"1174 категорий (вкл. MISSING, OTHER)"
+CD,категориальный,"17 категорий (вкл. MISSING, OTHER)"
+APC,категориальный,"11 категорий (вкл. MISSING, OTHER)"
+CPA,категориальный,"60 категорий (вкл. MISSING, OTHER)"
+CNC,категориальный,"151 категорий (вкл. MISSING, OTHER)"
+HL,категориальный,"13 категорий (вкл. MISSING, OTHER)"
+TYPE_LAT_LON,категориальный,"5 категорий (вкл. MISSING, OTHER)"
+EV,категориальный,"4 категорий (вкл. MISSING, OTHER)"
+WORK_DESC,текст,"WORK_DESC → TF-IDF(word 1-2, char_wb 3-5) → SVD(64)"
