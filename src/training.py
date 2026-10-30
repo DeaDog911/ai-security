@@ -26,6 +26,8 @@ TRAIN_HP = {
     "lr_plateau_factor": 0.5,
     "grad_clip": 1.0,
     "amp": True,               # float16 autocast на GPU
+    "loss": "mse",             # mse | huber
+    "huber_delta": 1.0,        # порог Huber в единицах log1p(y) (переводится в стандартизованную шкалу)
 }
 
 KEYS = ("num", "num_mask", "cat", "txt")
@@ -120,6 +122,11 @@ def fit(model, X_tr, y_tr, X_va, y_va_log, y_mean, y_std, device, thp: dict | No
     n, bs = len(yt), thp["batch_size"]
     steps_per_epoch = math.ceil(n / bs)
     gen = torch.Generator(device="cpu").manual_seed(seed)
+    if thp["loss"] == "huber":
+        delta_std = thp["huber_delta"] / y_std  # цель стандартизована: δ в log-шкале → δ / y_std
+        loss_fn = lambda p, t: F.huber_loss(p, t, delta=delta_std)  # noqa: E731
+    else:
+        loss_fn = F.mse_loss
 
     best = (float("inf"), None, -1)
     history, step, bad = [], 0, 0
@@ -135,14 +142,14 @@ def fit(model, X_tr, y_tr, X_va, y_va_log, y_mean, y_std, device, thp: dict | No
                     g["lr"] = thp["lr"] * (step + 1) / thp["warmup_steps"]
             with torch.autocast(device.type, dtype=torch.float16, enabled=use_amp):
                 pred = model(**{k: v[idx] for k, v in Xt.items()})
-            loss = F.mse_loss(pred.float(), yt[idx])
+            loss = loss_fn(pred.float(), yt[idx])
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), thp["grad_clip"])
             scaler.step(opt)
             scaler.update()
-            tot += loss.item() * len(idx)
+            tot += F.mse_loss(pred.float().detach(), yt[idx]).item() * len(idx)
             step += 1
         train_mse_std = tot / n
         p_va = predict(model, X_va, device) * y_std + y_mean
