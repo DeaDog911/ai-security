@@ -25,12 +25,12 @@
 - `venv` в корне проекта, Python 3.12. Создаётся скриптом `scripts/setup_env.ps1` командой `python -m virtualenv --python python312 venv` (требование пользователя: virtualenv, папка `venv`). Ключи: `-Cpu` — без GPU, `-Recreate` — пересоздать, `-PythonSpec` — другая версия. Системный Python пользователя — 3.13; 3.12 нужен для колёс ROCm.
 - PyTorch 2.9.1 + ROCm 7.2.1 (колёса AMD с repo.radeon.com), прочие пакеты — `requirements.txt`. Ядро Jupyter: «Python (ai-security)».
 - Проверка: `python src\check_device.py`.
-- Пути и константы (датасет, seed, B) — `src/config.py`. Датасет: https://data.lacity.org/A-Prosperous-City/LA-BUILD-PERMITS/xnhu-aczu/about_data
+- Пути и константы (датасет, seed, B) — `src/config.py`. Датасет — два набора LADBS (с 30.10.2026): https://data.lacity.org/City-Infrastructure-Service-Requests/Building-and-Safety-Building-Permits-Issued-Betwee/dyxf-7hc4/about_data и https://data.lacity.org/City-Infrastructure-Service-Requests/Building-and-Safety-Building-Permits-Issued-from-2/pi9x-tg5x/about_data
 - В облачной сессии пакеты не ставить: код пишется там, а запускается у пользователя.
 
 ## Структура (целевая)
 ```
-LA_BUILD_PERMITS_20261030.csv   исходный датасет (не изменять; ссылка — README.md)
+LA_BLDG_PERMITS_*_20261030.csv  исходный датасет, 2 файла (не изменять; ссылки — README.md)
 README.md                       установка окружения и источник данных
 scripts/setup_env.ps1           создание venv
 docs/practice_ai.docx           методичка ПР1–ПР4

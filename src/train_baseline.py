@@ -29,7 +29,7 @@ import pandas as pd
 import torch
 
 import stats as st
-from config import ARTIFACTS_DIR, BOOTSTRAP_B, DATASET_PATH, REPORTS_DIR, SEED
+from config import ARTIFACTS_DIR, BOOTSTRAP_B, DATASET_PATHS, DATASETS, REPORTS_DIR, SEED
 from data import SPLIT_INFO_PATH, TARGET, load_dataset
 from features import Preprocessor
 from model import DEFAULT_HP
@@ -63,7 +63,7 @@ def load_features(force: bool = False, log: logging.Logger | None = None):
     """
     log = log or logging.getLogger("ai-security")
     df = load_dataset().sort_values("row_id").reset_index(drop=True)
-    meta = df[["row_id", "split", "issue_date", "Permit Type", "Permit Sub-Type", "parcel"]].copy()
+    meta = df[["row_id", "split", "issue_date", "PERMIT_TYPE", "PERMIT_SUB_TYPE", "parcel"]].copy()
     meta["y_log"] = np.log1p(df[TARGET].to_numpy())
     prep_path = ARTIFACTS_DIR / "preprocessor.joblib"
     if prep_path.exists() and FEATURES_PATH.exists() and not force:
@@ -98,16 +98,17 @@ def file_md5(path, chunk=1 << 20) -> str:
     return h.hexdigest()
 
 
-def evaluate(y_log: np.ndarray, p_log: np.ndarray, B: int = BOOTSTRAP_B, seed: int = SEED) -> dict:
-    """RMSLE и MdAPE — bootstrap BCa; доля в пределах ±25% — Уилсон (основной) и bootstrap."""
+def evaluate(y_log: np.ndarray, p_log: np.ndarray, B: int = BOOTSTRAP_B, seed: int = SEED,
+             bca_max_n: int = st.BCA_MAX_N) -> dict:
+    """RMSLE и MdAPE — bootstrap (BCa при n ≤ bca_max_n); доля в ±25% — Уилсон (основной) и bootstrap."""
     rel = np.abs(np.expm1(p_log) - np.expm1(y_log)) / np.expm1(y_log)
+    kw = dict(vectorized=True, B=B, seed=seed, bca_max_n=bca_max_n)
     out = {
         "n": int(len(y_log)),
-        "rmsle": st.bootstrap_ci(st.rmsle, y_log, p_log, vectorized=True, B=B, seed=seed).as_dict(),
-        "mdape_pct": st.bootstrap_ci(st.mdape, y_log, p_log, vectorized=True, B=B, seed=seed).as_dict(),
+        "rmsle": st.bootstrap_ci(st.rmsle, y_log, p_log, **kw).as_dict(),
+        "mdape_pct": st.bootstrap_ci(st.mdape, y_log, p_log, **kw).as_dict(),
         "within25_wilson": st.proportion_ci(rel <= 0.25).as_dict(),
-        "within25_bootstrap": st.bootstrap_ci(st.within25, y_log, p_log, vectorized=True, B=B,
-                                              seed=seed).as_dict(),
+        "within25_bootstrap": st.bootstrap_ci(st.within25, y_log, p_log, **kw).as_dict(),
     }
     return out
 
@@ -201,7 +202,10 @@ def main() -> None:
     metrics = {}
     for p in ("val", "test"):
         d = preds[preds["split"] == p]
-        metrics[p] = evaluate(d["y_log"].to_numpy(), d["pred_log"].to_numpy())
+        # основная оценка (test) — BCa даже при n ≈ 100 тыс. (jackknife считается один раз);
+        # для val достаточно percentile
+        metrics[p] = evaluate(d["y_log"].to_numpy(), d["pred_log"].to_numpy(),
+                              bca_max_n=250_000 if p == "test" else st.BCA_MAX_N)
     # наивный ориентир: медиана log-цели train
     d = preds[preds["split"] == "test"]
     naive = np.full(len(d), np.median(y_log[idx["train"]]))
@@ -214,8 +218,9 @@ def main() -> None:
         "task": "регрессия log1p(Valuation); метрика RMSLE (меньше — лучше), доп. MdAPE и доля в ±25%",
         "seed": SEED,
         "smoke": args.smoke,
-        "dataset": {"file": DATASET_PATH.name, "md5": file_md5(DATASET_PATH),
-                    "source": "https://data.lacity.org/A-Prosperous-City/LA-BUILD-PERMITS/xnhu-aczu/about_data"},
+        "dataset": {k: {"file": DATASETS[k]["file"], "name": DATASETS[k]["name"], "url": DATASETS[k]["url"],
+                        "md5": file_md5(p), "export": "30.10.2026 (данные обновлены 25.10.2026)"}
+                    for k, p in DATASET_PATHS.items()},
         "split": json.loads(SPLIT_INFO_PATH.read_text(encoding="utf-8")),
         "features": prep.summary(),
         "model": {"arch": "FT-Transformer (pre-LN, ReGLU, [CLS]-голова, текст — отдельный токен)",

@@ -26,3 +26,11 @@
 - **FT-Transformer:** d_token 192, 3 блока, 8 голов, ReGLU FFN 256, attention dropout 0,2, FFN dropout 0,1; голова LN → ReLU → Linear по [CLS]; ≈ 2,1 млн параметров, 26 токенов.
 - **Обучение:** AdamW (lr 3e-4, wd 1e-5 без токенизатора/LN/bias), warmup 500 шагов, ReduceLROnPlateau(0,5, patience 2), ранняя остановка по val RMSLE (patience 6, max 60 эпох), batch 512, grad clip 1,0. Цель стандартизуется по train.
 - **CI метрик test:** RMSLE и MdAPE — BCa (n ≈ 52k); для n > 60 000 автоматически percentile (jackknife для BCa слишком дорог) — метод пишется в результат. Доля в ±25% — Уилсон (основной) и bootstrap для сравнения.
+
+## 2026-10-30 (смена датасета)
+- **Датасет заменён** (решение пользователя после разбора baseline): вместо `LA BUILD PERMITS` (xnhu-aczu, заморожен в 05.2023, текст обрезан до 70 символов) используются два набора LADBS с единой схемой:
+  «Building and Safety – Building Permits Issued Between 2010 and 2019 (N)» (dyxf-7hc4) и «… Issued from 2020 to Present (N)» (pi9x-tg5x). Выгрузка 30.10.2026 (данные обновлены 25.10.2026), файлы `LA_BLDG_PERMITS_2010_2019_20261030.csv` и `LA_BLDG_PERMITS_2020_PRESENT_20261030.csv`. Это тот же реестр: 294 из 300 случайных разрешений старого набора найдены по номеру, Valuation совпадает у всех.
+  Все решения ниже о старом датасете (форматы с NBSP, $501 ≈ 26 тыс., признаки подрядчика) — ~~для xnhu-aczu~~, см. этот раздел. Baseline на старом датасете (test RMSLE 1,045) не фиксируется.
+- **Отбор:** только Bldg-New, Bldg-Addition, Bldg-Alter/Repair (≈ 760 тыс. строк); остальные типы (Grading — оценка формальная, ~$1,7 тыс. в среднем; Pool, Sign, Demolition, Nonbldg — нет структурных признаков) исключены. Период — весь: 01.2010 – 24.10.2026.
+- **Что изменилось в признаках:** появились полный текст `WORK_DESC` (медиана 129 символов), `USE_DESC`, `CONSTRUCTION`, `HEIGHT`, `DU_CHANGED`/`ADU_CHANGED`, районы (CD, APC, CPA, CNC), `Business Unit`, дни от подачи до выдачи; пропали подрядчик, лицензия, этажность, PII заявителей.
+- **ID для дублей:** `PERMIT_NBR` и технический `REFRESH_TIME`. Ключ участка — `APN`.
