@@ -1,23 +1,23 @@
 # План: baseline-модель и ПР1
 
-Статус: план полностью согласован 2026-10-30. Реализация не начата.
+Статус: план согласован 2026-10-30. Этап 0 реализован, идёт обучение baseline (ждёт «ок» пользователя перед ПР1).
 
 ## Этап 0. Baseline-модель (нужна для ПР1–ПР4)
 - [x] `scripts/setup_env.ps1` + `requirements.txt` + `README.md`: создание venv (virtualenv, Python 3.12), PyTorch ROCm/CPU.
 - [x] `src/config.py`: пути, URL датасета, seed, B.
-- [x] `src/check_device.py`: версии, GPU, тесты matmul/SDPA/autocast, замер скорости обучения. Ждёт запуска у пользователя.
-- [ ] `src/stats.py`: `wilson_ci`, `bootstrap_ci` (BCa через scipy, fallback percentile, B = 2000, seed), `paired_bootstrap_ci`, `stratified_bootstrap_ci` — общие для ПР1–ПР4.
-- [ ] `src/data.py`: загрузка CSV, парсинг денег, чисел, дат и координат (NBSP, десятичная запятая, `POINT(lon lat)`); ключ участка Book-Page-Parcel.
-- [ ] Отбор строк для обучения: Valuation > 0; дубли без учёта ID удаляются до разбиения.
-- [ ] Split 70/15/15 хронологически по `Issue Date`. Пересечение участков между частями не запрещаем (в реальной работе участок может встретиться повторно), но измеряем в ПР1 как leakage. Индексы сохраняются в `artifacts/splits.parquet`.
-- [ ] `src/features.py`: препроцессор (fit только на train).
+- [x] `src/check_device.py`: версии, GPU, тесты matmul/SDPA/autocast, замер скорости обучения. Проверен: RX 7700 XT работает через ROCm, x128 к CPU.
+- [x] `src/stats.py`: `wilson_ci`, `bootstrap_ci` (BCa через scipy, fallback percentile, B = 2000, seed), `paired_bootstrap_ci`, `stratified_bootstrap_ci` — общие для ПР1–ПР4.
+- [x] `src/data.py`: загрузка CSV, парсинг денег, чисел, дат и координат (NBSP, десятичная запятая, `POINT(lon lat)`); ключ участка Book-Page-Parcel.
+- [x] Отбор строк для обучения: Valuation > 0; дубли без учёта ID удаляются до разбиения.
+- [x] Split 70/15/15 хронологически по `Issue Date`. Пересечение участков между частями не запрещаем (в реальной работе участок может встретиться повторно), но измеряем в ПР1 как leakage. Индексы сохраняются в `artifacts/splits.parquet`.
+- [x] `src/features.py`: препроцессор (fit только на train).
   - Исключаем ID, PII, признаки из будущего, столбцы с пропусками > 99%.
   - Числовые: площадь, этажи, квартиры, широта/долгота, год/месяц/день недели выдачи, срок до окончания лицензии; log1p для скошенных, клиппинг по квантилям train, индикаторы пропуска, стандартизация.
   - Категориальные: тип/подтип/категория, офис, зона, ZIP, census tract, тип лицензии, штат подрядчика, подрядчик; редкие (частота < порога) → `OTHER`, пропуск → `MISSING`.
   - Текст: TF-IDF (слова + символьные n-граммы) → TruncatedSVD(64) → один токен.
-- [ ] `src/model.py`: FT-Transformer — Feature Tokenizer (числа: w·x+b, категории: embedding, текст: linear) + [CLS] → N блоков (pre-LN, MHSA, FFN, dropout) → голова по [CLS].
-- [ ] `src/train_baseline.py`: AdamW, MSE на log1p, ранняя остановка по val RMSLE; сохранение весов, препроцессора, `config.json` (seed, гиперпараметры, split, версии библиотек), кривых обучения.
-- [ ] Оценка на test: RMSLE, MdAPE, доля в пределах ±25%, всё с bootstrap 95% CI (B = 2000).
+- [x] `src/model.py`: FT-Transformer — Feature Tokenizer (числа: w·x+b, категории: embedding, текст: linear) + [CLS] → N блоков (pre-LN, MHSA, FFN, dropout) → голова по [CLS].
+- [x] `src/train_baseline.py`: AdamW, MSE на log1p, ранняя остановка по val RMSLE; сохранение весов, препроцессора, `config.json` (seed, гиперпараметры, split, версии библиотек), кривых обучения.
+- [x] Оценка на test: RMSLE, MdAPE, доля в пределах ±25%, всё с bootstrap 95% CI (B = 2000).
 
 ## Этап 1. ПР1: профиль качества (`src/pr1_data_quality.py` → `reports/pr1/`)
 - [ ] Описание: источник, размер, модальности, число признаков, распределение цели, split.
