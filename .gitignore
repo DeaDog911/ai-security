@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 LA_BUILD_PERMITS_*.csv
+artifacts/
