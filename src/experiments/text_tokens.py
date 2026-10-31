@@ -387,6 +387,9 @@ def write_summary(rep: Path, res, paired, agg, by_group, best) -> None:
             txt.append(f"- {r['variant']}: средний ΔRMSLE {r['d_rmsle_mean']:+.4f} "
                        f"(min–max {r['d_rmsle_min']:+.4f}…{r['d_rmsle_max']:+.4f}); CI без 0 при всех seed: "
                        f"{'да' if r['ci_excl0_all'] else 'нет'} — {verdict}.")
+    notes = rep / "notes.md"  # разбор результатов, написанный вручную (не перезаписывается)
+    if notes.exists():
+        txt += ["", notes.read_text(encoding="utf-8").strip()]
     (rep / "summary.md").write_text("\n".join(txt) + "\n", encoding="utf-8")
 
 
