@@ -234,3 +234,44 @@ class Preprocessor:
     @staticmethod
     def load(path=PREPROCESSOR_PATH) -> "Preprocessor":
         return joblib.load(path)
+
+
+# ---------------------------------------------------------------- слова как токены (эксперимент text_tokens)
+WORD_RE = r"[a-z]+|\d+(?:\.\d+)?"  # слова и числа нормализованного текста
+
+
+def word_tokenize(s: pd.Series) -> pd.Series:
+    """Списки слов и чисел WORK_DESC (после normalize_text)."""
+    return normalize_text(s).str.findall(WORD_RE)
+
+
+@dataclass
+class WordVocab:
+    """Словарь слов по train: документная частота ≥ min_df, не больше max_size; PAD = 0, UNK = 1."""
+    min_df: int = 5
+    max_size: int = 20_000
+    index: dict[str, int] = field(default_factory=dict)
+
+    PAD, UNK = 0, 1
+
+    def fit(self, tokens: pd.Series) -> "WordVocab":
+        from collections import Counter
+        df = Counter()
+        for ws in tokens:
+            df.update(set(ws))
+        words = sorted((w for w, c in df.items() if c >= self.min_df), key=lambda w: (-df[w], w))[:self.max_size]
+        self.index = {w: i + 2 for i, w in enumerate(words)}
+        return self
+
+    @property
+    def size(self) -> int:
+        return len(self.index) + 2
+
+    def transform(self, tokens: pd.Series, max_len: int) -> np.ndarray:
+        """(N, max_len) int32: коды первых max_len слов, хвост — PAD."""
+        out = np.zeros((len(tokens), max_len), dtype=np.int32)
+        get = self.index.get
+        for i, ws in enumerate(tokens):
+            ids = [get(w, self.UNK) for w in ws[:max_len]]
+            out[i, :len(ids)] = ids
+        return out

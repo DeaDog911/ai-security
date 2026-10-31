@@ -31,6 +31,11 @@ TRAIN_HP = {
 }
 
 KEYS = ("num", "num_mask", "cat", "txt")
+OPTIONAL_KEYS = ("words",)  # слова WORK_DESC как токены (эксперимент text_tokens)
+
+
+def _keys(X: dict) -> list[str]:
+    return list(KEYS) + [k for k in OPTIONAL_KEYS if k in X]
 
 
 def set_seed(seed: int = SEED) -> None:
@@ -54,15 +59,16 @@ def device_name(device: torch.device) -> str:
 
 
 def subset(X: dict[str, np.ndarray], idx) -> dict[str, np.ndarray]:
-    return {k: X[k][idx] for k in KEYS}
+    return {k: X[k][idx] for k in _keys(X)}
 
 
 def to_device(X: dict[str, np.ndarray], device) -> dict[str, torch.Tensor]:
-    return {k: torch.as_tensor(X[k]).to(device) for k in KEYS}
+    return {k: torch.as_tensor(X[k]).to(device) for k in _keys(X)}
 
 
-def build_model(X: dict[str, np.ndarray], cat_cardinalities: list[int], hp: dict) -> FTTransformer:
-    return FTTransformer(X["num"].shape[1], cat_cardinalities, X["txt"].shape[1], hp)
+def build_model(X: dict[str, np.ndarray], cat_cardinalities: list[int], hp: dict, **model_kw) -> FTTransformer:
+    """model_kw — опции FTTransformer для экспериментов (txt_groups, word_vocab, word_len)."""
+    return FTTransformer(X["num"].shape[1], cat_cardinalities, X["txt"].shape[1], hp, **model_kw)
 
 
 def _param_groups(model, wd):
