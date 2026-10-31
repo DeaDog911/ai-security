@@ -99,9 +99,9 @@ def svd_features(n_comp: int, meta, prep, log, force: bool = False) -> tuple[np.
     return z, info
 
 
-def word_features(meta, log, force: bool = False) -> tuple[np.ndarray, dict]:
-    """Коды слов (N, WORD_LEN) int32; словарь по train. Кеш words_L<L>.npz."""
-    path = EXP_DIR / f"words_L{WORD_LEN}.npz"
+def word_features(meta, log, force: bool = False, L: int = WORD_LEN) -> tuple[np.ndarray, dict]:
+    """Коды слов (N, L) int32; словарь по train. Кеш words_L<L>.npz."""
+    path = EXP_DIR / f"words_L{L}.npz"
     if path.exists() and not force:
         z = np.load(path)
         if np.array_equal(z["row_id"], meta["row_id"].to_numpy()):
@@ -113,15 +113,15 @@ def word_features(meta, log, force: bool = False) -> tuple[np.ndarray, dict]:
     split = meta["split"].to_numpy()
     tr = split == "train"
     vocab = WordVocab(WORD_MIN_DF, WORD_MAX_VOCAB).fit(tokens[tr])
-    words = vocab.transform(tokens, WORD_LEN)
+    words = vocab.transform(tokens, L)
     lens = tokens.str.len().to_numpy()
-    info = {"L": WORD_LEN, "vocab_size": vocab.size, "min_df": WORD_MIN_DF, "max_vocab": WORD_MAX_VOCAB,
+    info = {"L": L, "vocab_size": vocab.size, "min_df": WORD_MIN_DF, "max_vocab": WORD_MAX_VOCAB,
             "len_quantiles_train": {str(q): float(np.quantile(lens[tr], q)) for q in (0.5, 0.9, 0.95, 0.99)},
             "seconds": round(time.perf_counter() - t0, 1)}
     for p in ("train", "val"):
         m = split == p
         nz = words[m] != 0
-        info[f"truncated_{p}"] = {"n": int((lens[m] > WORD_LEN).sum()), "share": float((lens[m] > WORD_LEN).mean())}
+        info[f"truncated_{p}"] = {"n": int((lens[m] > L).sum()), "share": float((lens[m] > L).mean())}
         info[f"unk_share_{p}"] = float((words[m][nz] == WordVocab.UNK).mean())
         info[f"empty_share_{p}"] = float((lens[m] == 0).mean())
     EXP_DIR.mkdir(parents=True, exist_ok=True)

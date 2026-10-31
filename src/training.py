@@ -107,10 +107,12 @@ def embed(model, X: dict[str, np.ndarray], device, batch_size: int = 4096) -> np
 
 
 def fit(model, X_tr, y_tr, X_va, y_va_log, y_mean, y_std, device, thp: dict | None = None,
-        log: logging.Logger | None = None, seed: int = SEED):
+        log: logging.Logger | None = None, seed: int = SEED, epoch_callback=None):
     """Обучение с ранней остановкой по val RMSLE.
 
     y_tr — стандартизованная цель ((log1p(y) − y_mean) / y_std), y_va_log — log1p(y) для val.
+    epoch_callback(epoch, model) — необязательный вызов после каждой эпохи (например, прогноз
+    на отложенных данных); на обучение не влияет.
     Возвращает (модель с лучшими весами, история по эпохам, номер лучшей эпохи).
     """
     thp = {**TRAIN_HP, **(thp or {})}
@@ -166,6 +168,8 @@ def fit(model, X_tr, y_tr, X_va, y_va_log, y_mean, y_std, device, thp: dict | No
         rec = {"epoch": epoch, "train_rmsle": float(np.sqrt(train_mse_std) * y_std), "val_rmsle": val_rmsle,
                "lr": lr_now, "sec": time.perf_counter() - t0}
         history.append(rec)
+        if epoch_callback is not None:
+            epoch_callback(epoch, model)
         improved = val_rmsle < best[0] - 1e-4
         if improved:
             best, bad = (val_rmsle, copy.deepcopy(model.state_dict()), epoch), 0
