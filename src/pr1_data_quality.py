@@ -160,6 +160,9 @@ def section_describe(ctx: Ctx) -> None:
     info = json.loads(SPLIT_INFO_PATH.read_text(encoding="utf-8"))
     meta, X, prep = ctx.feats
     s = prep.summary()
+    w = s.get("text_words")
+    words_txt = f" + {w['len']} слов-токенов" if w else ""
+    n_tokens = len(s["num_features"]) + len(s["cat_features"]) + 2 + (w["len"] if w else 0)
     rows = [
         ("Источник", "; ".join(f"{v['name']} ({k}), {v['url']}" for k, v in DATASETS.items())),
         ("Версия", "выгрузка 30.10.2026, данные обновлены 25.10.2026; файлы "
@@ -172,7 +175,7 @@ def section_describe(ctx: Ctx) -> None:
         ("Исключено: дубли без учёта ID", f"{info['n_dup_without_id_removed']:,}"),
         ("Строк для обучения", f"{info['n_clean']:,}"),
         ("Признаки модели", f"{len(s['num_features'])} числовых, {len(s['cat_features'])} категориальных, "
-                            f"текст → SVD(64); всего токенов {len(s['num_features']) + len(s['cat_features']) + 2}"),
+                            f"текст → SVD(64){words_txt}; всего токенов {n_tokens}"),
         ("Исходных столбцов", f"{len(raw_columns(ctx.raw))}"),
         ("Split", f"хронологический 70/15/15 по ISSUE_DATE: train {info['n_train']:,} "
                   f"({info['train_dates'][0]} … {info['train_dates'][1]}), val {info['n_val']:,} "
@@ -186,6 +189,10 @@ def section_describe(ctx: Ctx) -> None:
     feat += [{"признак": c, "тип": "категориальный", "преобразование": f"{k} категорий (вкл. MISSING, OTHER)"}
              for c, k in zip(s["cat_features"], s["cat_cardinalities"])]
     feat += [{"признак": "WORK_DESC", "тип": "текст", "преобразование": s["text_feature"]}]
+    if w:
+        feat += [{"признак": "WORK_DESC (слова)", "тип": "текст",
+                  "преобразование": f"до {w['len']} слов-токенов, словарь {w['vocab_size']:,} (df ≥ {w['min_df']}), "
+                                    f"эмбеддинг слова + позиционный, PAD маскируется"}]
     save_table(pd.DataFrame(feat), "describe_features")
     excl = [{"группа": k, "столбец": c} for k, v in s["dropped"].items() for c in v]
     save_table(pd.DataFrame(excl), "describe_excluded")
