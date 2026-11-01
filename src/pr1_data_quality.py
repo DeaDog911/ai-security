@@ -500,7 +500,8 @@ def section_uniqueness(ctx: Ctx) -> list[dict]:
                     fmt="{:.3f}", interp="в %; точных дублей нет (PERMIT_NBR уникален); дубли удалены до split"),
         summary_row("Уникальность", "near-duplicate rate (APN + MinHash Jaccard ≥ 0,9 + стоимость ±10%)",
                     to_ci(r.iloc[4]), scale=100, fmt="{:.2f}",
-                    interp="в %; повторные разрешения на те же работы — часть может попасть в разные части split"),
+                    interp=f"в %; в основном однотипные разрешения на разные объекты одного участка; "
+                           f"только полные APN — {r.iloc[8]['value'] * 100:.2f}%"),
         summary_row("Уникальность", "доля дополнительных разрешений (Supplemental)", to_ci(r.iloc[6]), scale=100,
                     fmt="{:.2f}", interp="в %; связаны с основным разрешением, стоимость часто служебная ($501)"),
     ]
@@ -563,7 +564,7 @@ def section_leakage(ctx: Ctx) -> list[dict]:
         summary_row("Train-test leakage", "test: точная копия входа модели в train", to_ci(t.iloc[0]), scale=100,
                     fmt="{:.2f}", interp="в %; типовые разрешения с одинаковым описанием — не утечка объекта, но завышают качество"),
         summary_row("Train-test leakage", "test: близкий дубль в train (APN + текст + стоимость ±10%)",
-                    to_ci(t.iloc[3]), scale=100, fmt="{:.3f}", interp="в %; повтор того же объекта/работ"),
+                    to_ci(t.iloc[3]), scale=100, fmt="{:.3f}", interp="в %; однотипные работы на том же участке"),
         summary_row("Train-test leakage", "test: участок встречается в train", to_ci(t.iloc[4]), scale=100,
                     fmt="{:.1f}", interp="в %; важно для MIA (ПР4): при privacy unit = участок выборки не независимы"),
     ]
