@@ -387,6 +387,11 @@ def minhash_signatures(ctx: Ctx) -> np.ndarray:
     return sig
 
 
+def masked_apn(ctx: Ctx) -> np.ndarray:
+    """APN с замаскированными последними цифрами («4118013***»): совпадение означает тот же квартал, а не участок."""
+    return ctx.clean["parcel"].astype("string").str.contains("*", regex=False).fillna(False).to_numpy(bool)
+
+
 def near_duplicate_pairs(ctx: Ctx) -> pd.DataFrame:
     """Пары строк clean на одном участке (APN) с оценкой Jaccard текста ≥ 0,9."""
     if PAIRS_PATH.exists() and not ctx.force:
@@ -394,7 +399,9 @@ def near_duplicate_pairs(ctx: Ctx) -> pd.DataFrame:
     sig = minhash_signatures(ctx)
     t0 = time.perf_counter()
     parcel = ctx.clean["parcel"]
-    groups = parcel[parcel.notna()].groupby(parcel[parcel.notna()]).indices
+    # позиции строк во всей таблице clean (строки без APN в группы не попадают; groupby по
+    # отфильтрованной серии дал бы позиции внутри неё — со сдвигом после каждой строки без APN)
+    groups = parcel.groupby(parcel, dropna=True).indices
     out_a, out_b, out_j = [], [], []
     for idx in groups.values():
         k = len(idx)
@@ -413,6 +420,8 @@ def near_duplicate_pairs(ctx: Ctx) -> pd.DataFrame:
     v = ctx.clean["valuation"].to_numpy()
     va, vb = v[pairs["a"]], v[pairs["b"]]
     pairs["close_value"] = np.abs(va - vb) / np.maximum(va, vb) <= VALUE_CLOSE
+    pa, pb = parcel.to_numpy()[pairs["a"]], parcel.to_numpy()[pairs["b"]]
+    assert all(x == y for x, y in zip(pa, pb)), "в паре близких дублей разные APN"
     pairs.to_parquet(PAIRS_PATH, index=False)
     log.info("near-dup пары: %d за %.0f с", len(pairs), time.perf_counter() - t0)
     return pairs
@@ -443,6 +452,10 @@ def section_uniqueness(ctx: Ctx) -> list[dict]:
     near_text = np.zeros(n, bool)
     near_text[_later(ctx, pairs)] = True
     suppl = ctx.clean["work_desc"].str.contains("supplement", case=False).to_numpy()
+    masked = masked_apn(ctx)
+    full = pairs[pairs["close_value"] & ~masked[pairs["a"].to_numpy()]]
+    near_full = np.zeros(n, bool)
+    near_full[_later(ctx, full)] = True
 
     rows = [
         wilson_row("точные дубли (все столбцы)", exact, совокупность="три типа Bldg"),
@@ -454,6 +467,9 @@ def section_uniqueness(ctx: Ctx) -> list[dict]:
         wilson_row(f"близкий текст на том же APN (Jaccard ≥ {JACCARD_NEAR}, без условия на стоимость)", near_text,
                    совокупность="строки для обучения"),
         wilson_row("дополнительные разрешения («Supplemental…» в описании)", suppl, совокупность="строки для обучения"),
+        wilson_row("APN замаскирован («…***», совпадение = тот же квартал)", masked, совокупность="строки для обучения"),
+        wilson_row("близкие дубли, только на полных (незамаскированных) APN", near_full,
+                   совокупность="строки для обучения"),
     ]
     tab = pd.DataFrame(rows)
     save_table(tab, "uniqueness")
@@ -463,7 +479,7 @@ def section_uniqueness(ctx: Ctx) -> list[dict]:
     c = ctx.clean
     save_table(pd.DataFrame({
         "PERMIT_NBR_a": c["PERMIT_NBR"].to_numpy()[ex["a"]], "PERMIT_NBR_b": c["PERMIT_NBR"].to_numpy()[ex["b"]],
-        "APN": c["parcel"].to_numpy()[ex["a"]], "jaccard": ex["jaccard"].to_numpy(),
+        "APN": c["parcel"].to_numpy()[ex["a"]], "APN замаскирован": masked[ex["a"]], "jaccard": ex["jaccard"].to_numpy(),
         "VALUATION_a": c["valuation"].to_numpy()[ex["a"]], "VALUATION_b": c["valuation"].to_numpy()[ex["b"]],
         "ISSUE_a": c["issue_date"].dt.date.to_numpy()[ex["a"]], "ISSUE_b": c["issue_date"].dt.date.to_numpy()[ex["b"]],
         "WORK_DESC_a": c["work_desc"].str[:150].to_numpy()[ex["a"]],
@@ -509,6 +525,7 @@ def section_leakage(ctx: Ctx) -> list[dict]:
     tr = split == "train"
     pairs = near_duplicate_pairs(ctx)
     a, b = pairs["a"].to_numpy(), pairs["b"].to_numpy()
+    masked = masked_apn(ctx)
     rows, summ = [], []
     for part in ("val", "test"):
         m = split == part
@@ -533,6 +550,7 @@ def section_leakage(ctx: Ctx) -> list[dict]:
             wilson_row("близкий дубль в train (APN + Jaccard ≥ 0,9)", nd, m, часть=part),
             wilson_row("близкий дубль в train + стоимость ±10%", ndv, m, часть=part),
             wilson_row("участок (APN) встречается в train", shared, m, часть=part),
+            wilson_row("участок встречается в train, только полные APN", shared, m & ~masked, часть=part),
         ]
     tab = pd.DataFrame(rows)
     save_table(tab, "leakage")
@@ -732,6 +750,63 @@ def section_labels(ctx: Ctx) -> list[dict]:
     ]
     save_table(pd.DataFrame(svc), "labels_service_values")
 
+    # диагностика случайного KFold: близкий дубль (тот же APN, Jaccard ≥ 0,9, стоимость ±10%) в другом фолде
+    # «подсказывает» метку, и OOF-остаток занижен; естественный контроль — дубль в том же фолде
+    pairs = near_duplicate_pairs(ctx)
+    pairs = pairs[pairs["close_value"]]
+    a, b = pairs["a"].to_numpy(), pairs["b"].to_numpy()
+    fold = np.full(len(c), -1)
+    fold[tr] = oof["fold"].to_numpy()
+    both = tr[a] & tr[b]
+    a, b = a[both], b[both]
+    other = np.zeros(len(c), bool)
+    same = np.zeros(len(c), bool)
+    diff = fold[a] != fold[b]
+    for x in (a, b):
+        other[x[diff]] = True
+        same[x[~diff]] = True
+    groups = {"близкий дубль в другом фолде": tr & other, "близкий дубль только в том же фолде": tr & same & ~other,
+              "без близкого дубля в train": tr & ~other & ~same}
+    diag = []
+    for name, g in groups.items():
+        abs_r = np.abs(r[g])
+        diag.append({"группа": name, "n": int(g.sum()),
+                     **ci_cols(st.bootstrap_ci(st.median_stat, abs_r, vectorized=True), "median_abs_r_"),
+                     **ci_cols(st.proportion_ci(susp[g]), "susp_")})
+    save_table(pd.DataFrame(diag), "labels_oof_neardup")
+
+    # зависимость критерия от модели: сравнение с прежним baseline (SVD(64), архив artifacts/baseline_svd64/)
+    old_path = ARTIFACTS_DIR / "baseline_svd64" / OOF_PATH.name
+    if old_path.exists():
+        old = pd.read_parquet(old_path)
+        assert np.array_equal(old["row_id"].to_numpy(), oof["row_id"].to_numpy())
+        r_new, r_old = r[tr], (old["y_log"] - old["oof_log"]).to_numpy()
+        z_old, med_old, mad_old = robust_z(r_old)
+        med_new, mad_new = zinfo["train"]["median_r"], zinfo["train"]["MAD_r"]
+        thr_old = Z_THRESHOLD * mad_old / 0.6745  # порог |r − median| прежней модели в log-единицах
+        s_new, s_old = np.abs(z[tr]) > Z_THRESHOLD, np.abs(z_old) > Z_THRESHOLD
+        dep = []
+        for name, mad, med, s, rr in (("C96 (текущий baseline)", mad_new, med_new, s_new, r_new),
+                                      ("SVD(64) (прежний baseline)", mad_old, med_old, s_old, r_old)):
+            thr = Z_THRESHOLD * mad / 0.6745
+            dep.append({"модель": name, "MAD остатков": mad, "порог |r − median|, log": thr,
+                        "порог, раз": float(np.exp(thr)), **ci_cols(st.proportion_ci(s), "susp_"),
+                        **ci_cols(st.proportion_ci(np.abs(rr - med) > thr_old), "susp_old_abs_thr_"),
+                        **ci_cols(st.proportion_ci(np.abs(rr) > BIG_RESIDUAL), "big_"),
+                        "доля квадратичной ошибки у подозрительных": float((rr[s] ** 2).sum() / (rr ** 2).sum())})
+        dep.append({"модель": "Jaccard наборов подозрительных (C96 vs SVD(64))",
+                    "MAD остатков": (s_new & s_old).sum() / (s_new | s_old).sum()})
+        save_table(pd.DataFrame(dep), "labels_model_dependence")
+        # прежние 20 худших: насколько изменились прогноз и z
+        top = np.argsort(-np.abs(z_old))[:20]
+        save_table(pd.DataFrame({
+            "PERMIT_NBR": c.loc[tr, "PERMIT_NBR"].to_numpy()[top], "VALUATION": c.loc[tr, "valuation"].to_numpy()[top],
+            "прогноз SVD(64) $": np.expm1(old["oof_log"].to_numpy()[top]).round(),
+            "прогноз C96 $": np.expm1(pred[tr][top]).round(),
+            "C96 / SVD(64)": np.expm1(pred[tr][top]) / np.expm1(old["oof_log"].to_numpy()[top]),
+            "z SVD(64)": z_old[top], "z C96": z[tr][top],
+            "WORK_DESC": c.loc[tr, "work_desc"].str[:120].to_numpy()[top]}), "labels_prev_worst20")
+
     # 20 худших примеров train (для ручного разбора)
     idx = np.flatnonzero(tr)[np.argsort(-np.abs(z[tr]))[:20]]
     worst = pd.DataFrame({
@@ -899,7 +974,9 @@ def section_shift(ctx: Ctx) -> list[dict]:
         cls = {k: embed(model, {kk: vv[v] for kk, vv in X.items()}, device) for k, v in samp.items()}
         np.savez_compressed(CLS_PATH, **cls)
 
-    comps = [("train", "test"), ("train", "val"), ("train_A", "train_B")]
+    # train vs *: объекты train — обучающие для baseline, поэтому в пространстве [CLS] сдвиг данных смешан
+    # с подгонкой модели под train; val vs test — обе части модель не видела (сдвиг между поздними периодами)
+    comps = [("train", "test"), ("train", "val"), ("train_A", "train_B"), ("val", "test")]
     rows = []
     for a, b in comps:
         for rep_name, getter in (("признаки без времени", lambda k: R[False][samp[k]]),
@@ -949,9 +1026,18 @@ def section_shift(ctx: Ctx) -> list[dict]:
     dt = pd.DataFrame({"n": g.size(), "медиана $": g["v"].median(), "p25 $": g["v"].quantile(.25),
                        "p75 $": g["v"].quantile(.75), "доля $501": g["s501"].mean(), "доля Alter/Repair": g["alter"].mean(),
                        "доля Commercial": g["comm"].mean(), "доля Supplemental": g["supp"].mean(),
-                       "пропуск площади": g["sqft_miss"].mean(),
-                       "RMSLE (train: OOF, val/test: baseline)": np.sqrt(g["r2"].mean())}).reset_index()
+                       "пропуск площади": g["sqft_miss"].mean()}).reset_index()
     save_table(dt, "shift_by_year")
+
+    # ошибка по годам отдельно для частей: train — OOF (случайные фолды внутри периода, интерполяция),
+    # val/test — baseline (прогноз вперёд по времени); 2022 г. содержит train и val
+    err = []
+    for (year, part), ix in pd.DataFrame({"год": yr, "часть": split}).groupby(["год", "часть"]).indices.items():
+        ci = st.bootstrap_ci(st.rmsle, y[ix], pred[ix], vectorized=True)
+        err.append({"год": year, "часть": part, "прогноз": "OOF 5-fold" if part == "train" else "baseline",
+                    "n": len(ix), **ci_cols(ci)})
+    err = pd.DataFrame(err).sort_values(["год", "часть"]).reset_index(drop=True)
+    save_table(err, "shift_error_by_year")
 
     fig, ax = plt.subplots(1, 3, figsize=(16, 4.3))
     ax[0].fill_between(dt["год"], dt["p25 $"], dt["p75 $"], alpha=0.3, label="IQR")
@@ -962,7 +1048,12 @@ def section_shift(ctx: Ctx) -> list[dict]:
         ax[1].plot(dt["год"], dt[col], "o-", ms=3, label=col)
     ax[1].set(xlabel="год выдачи", ylabel="доля", title="Состав по годам")
     ax[1].legend(fontsize=7)
-    ax[2].plot(dt["год"], dt["RMSLE (train: OOF, val/test: baseline)"], "o-")
+    for part, col in (("train", "C0"), ("val", "C1"), ("test", "C3")):
+        e = err[err["часть"] == part]
+        x = e["год"] + {"train": -0.1, "val": 0.0, "test": 0.1}[part]
+        ax[2].errorbar(x, e["value"], yerr=[e["value"] - e["ci_low"], e["ci_high"] - e["value"]], fmt="o-",
+                       ms=3, capsize=2, color=col, label=f"{part} ({'OOF' if part == 'train' else 'baseline'})")
+    ax[2].legend(fontsize=7)
     b1 = c.loc[split == "val", "issue_date"].min().year + c.loc[split == "val", "issue_date"].min().dayofyear / 366
     b2 = c.loc[split == "test", "issue_date"].min().year + c.loc[split == "test", "issue_date"].min().dayofyear / 366
     for bx, lab in ((b1, "начало val"), (b2, "начало test")):
@@ -974,7 +1065,7 @@ def section_shift(ctx: Ctx) -> list[dict]:
     save_fig(fig, "shift_by_year")
 
     fig, ax = plt.subplots(figsize=(9, 4))
-    sub = mmd[mmd["сравнение"] != "train vs val"]
+    sub = mmd[~mmd["сравнение"].isin(["train vs val", "val vs test"])]
     labels = [f"{r['сравнение']}\n{r['представление']}" for _, r in sub.iterrows()]
     ax.bar(range(len(sub)), sub["mmd2_u"], yerr=[(sub["mmd2_u"] - sub["ci_low"]).clip(lower=0),
                                                 (sub["ci_high"] - sub["mmd2_u"]).clip(lower=0)],
@@ -988,6 +1079,7 @@ def section_shift(ctx: Ctx) -> list[dict]:
     m0 = mmd[(mmd["сравнение"] == "train vs test") & (mmd["представление"] == "признаки без времени")].iloc[0]
     mc = mmd[(mmd["сравнение"] == "train vs test") & (mmd["представление"] == "эмбеддинги [CLS] baseline")].iloc[0]
     ctl = mmd[(mmd["сравнение"] == "train_A vs train_B") & (mmd["представление"] == "признаки без времени")].iloc[0]
+    mvt = mmd[(mmd["сравнение"] == "val vs test") & (mmd["представление"] == "эмбеддинги [CLS] baseline")].iloc[0]
     ci_lr = c2_ci[("train", "test", False, "логистическая регрессия")]
     ci_mlp = c2_ci[("train", "test", False, "MLP (64)")]
     ks_t = ks[1]
@@ -998,7 +1090,9 @@ def section_shift(ctx: Ctx) -> list[dict]:
                            f"p = {ctl['p_value']:.2f})"),
         summary_row("Shift (репрезентативность)", "MMD²_u train vs test (эмбеддинги [CLS])",
                     st.CI(mc["mmd2_u"], mc["ci_low"], mc["ci_high"], "percentile", int(mc["m"] + mc["n"])), fmt="{:.4f}",
-                    interp=f"permutation p = {mc['p_value']:.3g}; сдвиг в пространстве представлений модели"),
+                    interp=f"permutation p = {mc['p_value']:.3g}; train-объекты — обучающие для модели, поэтому сдвиг "
+                           f"смешан с подгонкой под train; val vs test (обе не видела): MMD² {mvt['mmd2_u']:.4f}, "
+                           f"p = {mvt['p_value']:.3g}"),
         summary_row("Shift (репрезентативность)", "C2ST ROC-AUC train vs test (логрег, без времени)", ci_lr,
                     fmt="{:.3f}", interp="0,5 — неразличимы; стратиф. bootstrap по классам"),
         summary_row("Shift (репрезентативность)", "C2ST ROC-AUC train vs test (MLP, без времени)", ci_mlp,
@@ -1072,6 +1166,19 @@ def section_drift_facts(ctx: Ctx) -> None:
         rows += [wilson_row(f"{col}: значение не встречается в train", new_val, split == part, часть=part)
                  for part in ("val", "test")]
     save_table(pd.DataFrame(rows), "shift_drift_facts")
+
+    # слова-токены baseline по годам: словарь собран по train, новые тексты его «перерастают»
+    _, X, prep = ctx.feats
+    if "words" in X:
+        w = X["words"]
+        nz = w != 0
+        dfw = pd.DataFrame({"год": c["issue_date"].dt.year.to_numpy(), "unk": (w == 1).sum(1), "tok": nz.sum(1),
+                            "trunc": nz.sum(1) == prep.word_len})
+        g = dfw.groupby("год")
+        save_table(pd.DataFrame({"доля UNK среди слов": g["unk"].sum() / g["tok"].sum(),
+                                 "средняя длина, слов": g["tok"].mean(),
+                                 f"обрезано на {prep.word_len} словах": g["trunc"].mean(),
+                                 "n": g.size()}).reset_index(), "shift_text_vocab_by_year")
     log.info("drift_facts: готово")
 
 
