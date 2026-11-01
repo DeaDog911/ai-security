@@ -14,6 +14,8 @@
     num_mask  (N, n_num) bool    — индикатор пропуска (в модели — отдельный эмбеддинг)
     cat       (N, n_cat) int64   — коды категорий: 0 = MISSING, 1 = OTHER (редкая/новая)
     txt       (N, 64)    float32 — WORK_DESC: TF-IDF (слова + симв. n-граммы) → SVD(64)
+    words     (N, 96)    int32   — WORK_DESC: коды первых WORD_LEN слов (PAD = 0, UNK = 1), словарь по train;
+                                   в модели — отдельные токены (с 2026-11-01, эксперимент text_tokens)
 """
 from __future__ import annotations
 
@@ -62,6 +64,9 @@ MISSING_MAX = 0.99  # столбцы с большей долей пропуск
 MIN_FREQ = 10        # категории реже этого (в train) → OTHER
 CLIP_Q = (0.001, 0.999)
 TXT_DIM = 64
+WORD_LEN = 96        # длина последовательности слов WORK_DESC (0 — без слов-токенов, как до 2026-11-01)
+WORD_MIN_DF = 5
+WORD_MAX_VOCAB = 20_000
 
 
 def numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
@@ -127,9 +132,11 @@ class Preprocessor:
     txt_std: np.ndarray | None = None
     y_mean: float = 0.0
     y_std: float = 1.0
+    word_vocab: "WordVocab | None" = None
+    word_len: int = 0
 
     # ---------------------------------------------------------------- fit
-    def fit(self, train: pd.DataFrame, y_log: np.ndarray | None = None) -> "Preprocessor":
+    def fit(self, train: pd.DataFrame, y_log: np.ndarray | None = None, word_len: int = WORD_LEN) -> "Preprocessor":
         self.dropped = {k: list(v) for k, v in EXCLUDED.items()}
         self.dropped["missing>99%"] = []
         self.dropped["constant"] = []
@@ -174,7 +181,18 @@ class Preprocessor:
 
         if y_log is not None:
             self.y_mean, self.y_std = float(np.mean(y_log)), float(np.std(y_log))
+        if word_len:
+            self.fit_words(train, word_len)
         return self
+
+    def fit_words(self, train: pd.DataFrame, word_len: int = WORD_LEN) -> "Preprocessor":
+        """Словарь слов WORK_DESC по train (можно добавить к уже обученному препроцессору)."""
+        self.word_vocab = WordVocab(WORD_MIN_DF, WORD_MAX_VOCAB).fit(word_tokenize(train[TEXT_COL]))
+        self.word_len = word_len
+        return self
+
+    def transform_words(self, df: pd.DataFrame) -> np.ndarray:
+        return self.word_vocab.transform(word_tokenize(df[TEXT_COL]), self.word_len)
 
     # ---------------------------------------------------------------- transform
     def transform(self, df: pd.DataFrame, chunk: int = 100_000) -> dict[str, np.ndarray]:
@@ -200,17 +218,27 @@ class Preprocessor:
             m = sp.hstack([self.tfidf_word.transform(t), self.tfidf_char.transform(t)]).tocsr()
             z.append(self.svd.transform(m))
         z = (np.concatenate(z) - self.txt_mean) / self.txt_std
-        return {
+        out = {
             "num": np.stack(xs, 1).astype(np.float32),
             "num_mask": np.stack(masks, 1),
             "cat": np.stack(codes, 1),
             "txt": z.astype(np.float32),
         }
+        if self.word_vocab is not None:
+            out["words"] = self.transform_words(df)
+        return out
 
     # ---------------------------------------------------------------- прочее
     @property
     def cat_cardinalities(self) -> list[int]:
         return [len(self.cat_vocab[c]) + 2 for c in self.cat_names]
+
+    @property
+    def model_kw(self) -> dict:
+        """Опции FTTransformer, которые определяются препроцессором (слова-токены)."""
+        if self.word_vocab is None:
+            return {}
+        return {"word_vocab": self.word_vocab.size, "word_len": self.word_len}
 
     def summary(self) -> dict:
         return {
@@ -220,6 +248,9 @@ class Preprocessor:
             "cat_cardinalities": self.cat_cardinalities,
             "text_feature": f"WORK_DESC → TF-IDF(word 1-2, char_wb 3-5) → SVD({TXT_DIM})",
             "text_svd_explained_variance": float(self.svd.explained_variance_ratio_.sum()),
+            "text_words": None if self.word_vocab is None else {
+                "len": self.word_len, "vocab_size": self.word_vocab.size, "min_df": self.word_vocab.min_df,
+                "max_vocab": self.word_vocab.max_size, "token_re": WORD_RE, "pad": 0, "unk": 1},
             "min_freq_other": MIN_FREQ,
             "clip_quantiles": list(CLIP_Q),
             "dropped": self.dropped,

@@ -626,7 +626,7 @@ def compute_oof(ctx: Ctx) -> pd.DataFrame:
         t0 = time.perf_counter()
         log.info("OOF fold %d/%d: train %d, held-out %d", f + 1, N_FOLDS, len(a), len(b))
         set_seed(SEED)
-        model = build_model(X, prep.cat_cardinalities, DEFAULT_HP)
+        model = build_model(X, prep.cat_cardinalities, DEFAULT_HP, **prep.model_kw)
         model, h, best = fit(model, sub(tr[a]), (y[tr[a]] - prep.y_mean) / prep.y_std, sub(va), y[va],
                              prep.y_mean, prep.y_std, device, TRAIN_HP, log)
         oof[b] = predict(model, sub(tr[b]), device) * prep.y_std + prep.y_mean
@@ -886,7 +886,7 @@ def section_shift(ctx: Ctx) -> list[dict]:
         cls = {k: z[k] for k in z.files}
     else:
         _, X, prep = ctx.feats
-        model = build_model(X, prep.cat_cardinalities, DEFAULT_HP)
+        model = build_model(X, prep.cat_cardinalities, DEFAULT_HP, **prep.model_kw)
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         model.to(device)
         cls = {k: embed(model, {kk: vv[v] for kk, vv in X.items()}, device) for k, v in samp.items()}

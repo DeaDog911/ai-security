@@ -41,8 +41,8 @@ from config import ARTIFACTS_DIR, BOOTSTRAP_B, REPORTS_DIR, SEED  # noqa: E402
 from data import load_dataset  # noqa: E402
 from features import TEXT_COL, WordVocab, normalize_text, word_tokenize  # noqa: E402
 from model import DEFAULT_HP, FTTransformer  # noqa: E402
-from train_baseline import MODEL_PATH, PRED_PATH, get_logger, load_features  # noqa: E402
-from training import TRAIN_HP, build_model, device_name, fit, get_device, predict, set_seed  # noqa: E402
+from train_baseline import get_logger, load_features  # noqa: E402
+from training import KEYS, TRAIN_HP, build_model, device_name, fit, get_device, predict, set_seed  # noqa: E402
 
 EXP_DIR = ARTIFACTS_DIR / "experiments" / "text_tokens"
 REP_DIR = REPORTS_DIR / "experiments" / "text_tokens"
@@ -54,6 +54,15 @@ WORD_MAX_VOCAB = 20_000
 B_COMPONENTS, B_GROUPS = 256, 8
 D_COMPONENTS = 128
 BASELINE_VAL_RMSLE = 0.98162
+# С 2026-11-01 baseline — C96; прежний baseline (вариант A) сохранён здесь:
+OLD_BASELINE_DIR = ARTIFACTS_DIR / "baseline_svd64"
+MODEL_PATH = OLD_BASELINE_DIR / "baseline_model.pt"
+PRED_PATH = OLD_BASELINE_DIR / "baseline_predictions.parquet"
+
+
+def base_inputs(X: dict) -> dict:
+    """Признаки прежнего baseline (без слов-токенов)."""
+    return {k: X[k] for k in KEYS}
 
 VARIANTS = {
     "A": "SVD(64) → 1 токен (baseline)",
@@ -135,6 +144,7 @@ def word_features(meta, log, force: bool = False, L: int = WORD_LEN) -> tuple[np
 
 def variant_inputs(v: str, meta, X, prep, log) -> tuple[dict, dict, dict]:
     """(признаки X, опции модели, сведения о представлении текста)."""
+    X = base_inputs(X)
     if v == "A":
         return X, {}, {"explained_variance": float(prep.svd.explained_variance_ratio_.sum())}
     if v == "B":
@@ -152,6 +162,7 @@ def variant_inputs(v: str, meta, X, prep, log) -> tuple[dict, dict, dict]:
 # ---------------------------------------------------------------- проверка baseline
 def check_baseline(meta, X, prep, device, log) -> dict:
     """Веса baseline грузятся в FTTransformer(DEFAULT_HP) без изменений; прогноз на 1000 строк val совпадает."""
+    X = base_inputs(X)
     model = build_model(X, prep.cat_cardinalities, DEFAULT_HP)
     assert isinstance(model, FTTransformer)
     model.load_state_dict(torch.load(MODEL_PATH, map_location="cpu"), strict=True)

@@ -32,7 +32,7 @@ import torch  # noqa: E402
 import stats as st  # noqa: E402
 from config import ARTIFACTS_DIR, BOOTSTRAP_B, SEED  # noqa: E402
 from model import DEFAULT_HP  # noqa: E402
-from text_tokens import DECISION_DELTA, EXP_DIR, REP_DIR, _md, word_features  # noqa: E402
+from text_tokens import DECISION_DELTA, EXP_DIR, REP_DIR, _md, base_inputs, word_features  # noqa: E402
 from train_baseline import get_logger, load_features  # noqa: E402
 from training import TRAIN_HP, build_model, device_name, fit, get_device, predict, set_seed  # noqa: E402
 
@@ -63,6 +63,7 @@ def split_val(meta) -> tuple[np.ndarray, np.ndarray, dict]:
 
 
 def inputs(v: str, meta, X, log) -> tuple[dict, dict]:
+    X = base_inputs(X)
     L = VARIANTS[v][1]
     if L is None:
         return X, {}

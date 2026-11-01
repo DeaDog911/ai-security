@@ -31,7 +31,7 @@ import torch
 import stats as st
 from config import ARTIFACTS_DIR, BOOTSTRAP_B, DATASET_PATHS, DATASETS, REPORTS_DIR, SEED
 from data import SPLIT_INFO_PATH, TARGET, load_dataset
-from features import Preprocessor
+from features import WORD_LEN, Preprocessor
 from model import DEFAULT_HP
 from training import TRAIN_HP, build_model, device_name, fit, get_device, predict, set_seed
 
@@ -70,7 +70,22 @@ def load_features(force: bool = False, log: logging.Logger | None = None):
         prep = Preprocessor.load(prep_path)
         z = np.load(FEATURES_PATH)
         if np.array_equal(z["row_id"], meta["row_id"].to_numpy()):
-            return meta, {k: z[k] for k in ("num", "num_mask", "cat", "txt")}, prep
+            X = {k: z[k] for k in z.files if k != "row_id"}
+            if getattr(prep, "word_len", 0) != WORD_LEN or ("words" in X) != bool(WORD_LEN):
+                # препроцессор до 2026-11-01 (без слов-токенов): числа, категории и SVD не меняются,
+                # добавляется только словарь слов по train
+                t0 = time.perf_counter()
+                tr = meta["split"].to_numpy() == "train"
+                X.pop("words", None)
+                if WORD_LEN:
+                    prep.fit_words(df[tr], WORD_LEN)
+                    X["words"] = prep.transform_words(df)
+                else:
+                    prep.word_vocab, prep.word_len = None, 0
+                prep.save(prep_path)
+                np.savez_compressed(FEATURES_PATH, row_id=meta["row_id"].to_numpy(), **X)
+                log.info("слова-токены (L = %d) добавлены к признакам за %.0f с", WORD_LEN, time.perf_counter() - t0)
+            return meta, X, prep
         log.info("features.npz не соответствует split — пересчитываю")
     t0 = time.perf_counter()
     tr = meta["split"].to_numpy() == "train"
@@ -175,7 +190,7 @@ def main() -> None:
 
     sub = lambda p: {k: v[idx[p]] for k, v in X.items()}  # noqa: E731
     y_tr_std = (y_log[idx["train"]] - prep.y_mean) / prep.y_std
-    model = build_model(X, prep.cat_cardinalities, hp)
+    model = build_model(X, prep.cat_cardinalities, hp, **prep.model_kw)
     n_params = sum(p.numel() for p in model.parameters())
     log.info("FT-Transformer: %d параметров, %d токенов", n_params, model.tokenizer.n_tokens)
 
@@ -223,7 +238,9 @@ def main() -> None:
                     for k, p in DATASET_PATHS.items()},
         "split": json.loads(SPLIT_INFO_PATH.read_text(encoding="utf-8")),
         "features": prep.summary(),
-        "model": {"arch": "FT-Transformer (pre-LN, ReGLU, [CLS]-голова, текст — отдельный токен)",
+        "model": {"arch": "FT-Transformer (pre-LN, ReGLU, [CLS]-голова; текст — SVD-токен + слова-токены, "
+                          "PAD маскируется в attention)",
+                  "model_kw": prep.model_kw,
                   "hp": hp, "n_params": int(n_params), "n_tokens": int(model.tokenizer.n_tokens),
                   "init": f"torch default + uniform(±1/sqrt(d)) для токенизатора, seed {SEED}"},
         "training": {**thp, "loss": "MSE на стандартизованном log1p(y)", "optimizer": "AdamW",
