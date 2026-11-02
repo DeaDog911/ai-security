@@ -1,0 +1,25 @@
+{
+ "r2_rule": "VALUATION ∈ {$501, $301} ∪ {≤ $10}",
+ "r2_share": {
+  "train": 0.07447502597685039,
+  "val": 0.09368451715356932
+ },
+ "r2_n": {
+  "train": 36984,
+  "val": 9970
+ },
+ "le600_n_train": 40822,
+ "r2_other_reviewed": 30,
+ "r2_other_admin": 5,
+ "r2_other_admin_share": 0.16666666666666666,
+ "r2_other_admin_low": 0.0733654237184855,
+ "r2_other_admin_high": 0.3356435050641603,
+ "r3_kept_words": [
+  "correct permit",
+  "no actual work"
+ ],
+ "r3_kept_share_train": 5.4370151994780466e-05,
+ "r3_min_precision": 0.7,
+ "r3_min_coverage": 0.005,
+ "r3_kept": false
+}
