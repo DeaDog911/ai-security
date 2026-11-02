@@ -9,14 +9,17 @@ val_sel — ранняя остановка и выбор эпохи, val_hold �
     R3 — административные разрешения по тексту — отброшен на шаге 0 (ни одна фраза не набрала
          точность ≥ 70% при покрытии ≥ 0,5% train; разметка — reports/experiments/label_cleaning/).
 
-Варианты (× seed 42, 43, 44; set_seed перед build_model):
-    A_full  — полный train и val_sel (эталон; совпадает с text_tokens_holdout A);
-    A_noR2  — train и val_sel без R2.
+Варианты (set_seed перед build_model):
+    A_full    — полный train и val_sel (эталон; совпадает с text_tokens_holdout A), seed 42, 43, 44;
+    A_noR2    — train и val_sel без R2, seed 42, 43, 44;
+    C96_full  — эталон C96 (берётся из text_tokens_holdout C96), seed 42, 43;
+    C96_noR2  — подтверждающий запуск C96 без R2, seed 42, 43 (решение пользователя 2026-11-02).
 
 Запуск из корня проекта:
     venv\\Scripts\\python src\\experiments\\label_cleaning.py --step0          # шаг 0: выборки и точность правил
-    venv\\Scripts\\python src\\experiments\\label_cleaning.py --smoke          # 5000 строк train, 2 эпохи
+    venv\\Scripts\\python src\\experiments\\label_cleaning.py --smoke --variants C96_noR2   # 5000 строк, 2 эпохи
     venv\\Scripts\\python src\\experiments\\label_cleaning.py --variants A_full,A_noR2 --seeds 42,43,44
+    venv\\Scripts\\python src\\experiments\\label_cleaning.py --variants C96_full,C96_noR2 --seeds 42,43
     venv\\Scripts\\python src\\experiments\\label_cleaning.py --report
 Готовые запуски (artifacts/experiments/label_cleaning/<вариант>_s<seed>/) без --force не пересчитываются.
 Отчёт: reports/experiments/label_cleaning/.
@@ -39,8 +42,8 @@ import torch  # noqa: E402
 import stats as st  # noqa: E402
 from config import ARTIFACTS_DIR, BOOTSTRAP_B, REPORTS_DIR, SEED  # noqa: E402
 from model import DEFAULT_HP  # noqa: E402
-from text_tokens import DECISION_DELTA, _md, base_inputs  # noqa: E402
-from text_tokens_holdout import HOLD_DIR, split_val  # noqa: E402
+from text_tokens import DECISION_DELTA, _md  # noqa: E402
+from text_tokens_holdout import HOLD_DIR, inputs, split_val  # noqa: E402
 from train_baseline import get_logger, load_features  # noqa: E402
 from training import TRAIN_HP, build_model, device_name, fit, get_device, predict, set_seed  # noqa: E402
 
@@ -60,11 +63,18 @@ R3_SAMPLE = {"supplement": 30, "fee": 25, "capture": 24, "correct permit": 10, "
 R3_MIN_PRECISION = 0.70
 R3_MIN_COVERAGE = 0.005  # доля train; меньше — R3 отбрасывается
 
+# вариант → (описание, правило очистки, вариант модели из text_tokens_holdout)
 VARIANTS = {
-    "A_full": ("полный train и val_sel (эталон)", None),
-    "A_noR2": ("train и val_sel без R2", "R2"),
+    "A_full": ("A: полный train и val_sel (эталон)", None, "A"),
+    "A_noR2": ("A: train и val_sel без R2", "R2", "A"),
+    "C96_full": ("C96: полный train и val_sel (эталон)", None, "C96"),
+    "C96_noR2": ("C96: train и val_sel без R2", "R2", "C96"),
 }
-REFERENCE = "A_full"
+REFERENCE_OF = {"A_noR2": "A_full", "C96_noR2": "C96_full"}
+# собственный очищенный срез варианта (решение пользователя 2026-11-02) и минимум seed для правила решения
+CRITERION_SLICE = {"A_noR2": "noR2", "C96_noR2": "noR2"}
+MIN_SEEDS = {"A_noR2": 3, "C96_noR2": 2}
+REFERENCE = "A_full"  # эталон, воспроизводимость которого проверяется бит-в-бит
 SMOKE_ROWS = 5000
 
 
@@ -170,7 +180,7 @@ def run(v, seed, meta, X, prep, device, log, smoke: bool, force: bool) -> None:
     if (out / "metrics.json").exists() and not force:
         log.info("%s seed %d: уже готов, пропускаю", v, seed)
         return
-    Xv = base_inputs(X)
+    Xv, model_kw = inputs(VARIANTS[v][2], meta, X, log)  # те же входы, что у эталона в text_tokens_holdout
     y_log = meta["y_log"].to_numpy()
     drop = rule_mask(VARIANTS[v][1], meta)
     tr = np.flatnonzero((meta["split"].to_numpy() == "train") & ~drop)
@@ -190,7 +200,7 @@ def run(v, seed, meta, X, prep, device, log, smoke: bool, force: bool) -> None:
         hold_preds.append((predict(model, X_hold, device) * prep.y_std + prep.y_mean).astype(np.float32))
 
     set_seed(seed)
-    model = build_model(Xv, prep.cat_cardinalities, DEFAULT_HP)
+    model = build_model(Xv, prep.cat_cardinalities, DEFAULT_HP, **model_kw)
     log.info("=== %s (%s), seed %d: train %d, val_sel %d, val_hold %d", v, VARIANTS[v][0], seed, len(tr), len(sel),
              len(hold))
     t0 = time.perf_counter()
@@ -233,9 +243,11 @@ def check_reference(log) -> dict:
     return res
 
 
-def adopt_reference(seed: int, meta, log) -> bool:
-    """A_full для seed ≠ 42 берётся из text_tokens_holdout A (тот же код и данные), если seed 42 совпал бит-в-бит."""
-    out, src = run_dir(REFERENCE, seed, False), HOLD_DIR / f"A_s{seed}"
+def adopt_reference(v: str, seed: int, meta, log) -> bool:
+    """Эталон (*_full) берётся из text_tokens_holdout (тот же код, входы и данные), если A_full seed 42 совпал
+    с ним бит-в-бит. Для C96 повторный запуск seed 42 (≈ 30 мин) не делается: совпадение A подтверждает,
+    что путь обучения не изменился."""
+    out, src = run_dir(v, seed, False), HOLD_DIR / f"{VARIANTS[v][2]}_s{seed}"
     if (out / "metrics.json").exists():
         return True
     if not (src / "metrics.json").exists() or not check_reference(log).get("bitwise"):
@@ -247,12 +259,12 @@ def adopt_reference(seed: int, meta, log) -> bool:
     out.mkdir(parents=True, exist_ok=True)
     for f in ("history.csv", "hold_predictions.parquet"):
         (out / f).write_bytes((src / f).read_bytes())
-    m = {"variant": REFERENCE, "seed": seed, "smoke": False, "n_train": int(tr.sum()), "n_sel": int(len(sel)),
+    m = {"variant": v, "seed": seed, "smoke": False, "n_train": int(tr.sum()), "n_sel": int(len(sel)),
          "n_hold": m0["n_hold"], "train_y_mean": float(y_log[tr].mean()), "train_y_std": float(y_log[tr].std()),
          **{k: m0[k] for k in ("best_epoch", "epochs_run", "sel_rmsle", "sec_per_epoch", "train_seconds", "device")},
          "adopted_from": str(src.relative_to(ARTIFACTS_DIR.parent))}
     (out / "metrics.json").write_text(json.dumps(m, ensure_ascii=False, indent=1), encoding="utf-8")
-    log.info("A_full seed %d: взят из %s (seed 42 совпал бит-в-бит)", seed, src)
+    log.info("%s seed %d: взят из %s (A_full seed 42 совпал бит-в-бит)", v, seed, src)
     return True
 
 
@@ -264,9 +276,6 @@ def _ci_cols(ci: st.CI, name: str) -> dict:
 def _slices(meta, hold_row_id: np.ndarray) -> dict[str, np.ndarray]:
     r2 = rule_mask("R2", meta.set_index("row_id").loc[hold_row_id].reset_index())
     return {"full": np.ones(len(hold_row_id), dtype=bool), "noR2": ~r2, "onlyR2": r2}
-
-
-CRITERION_SLICE = {"A_noR2": "noR2"}  # собственный очищенный срез варианта (решение пользователя 2026-11-02)
 
 
 def report(meta, log, smoke: bool = False) -> None:
@@ -298,22 +307,23 @@ def report(meta, log, smoke: bool = False) -> None:
 
     paired = []
     for (v, s), d in sorted(preds.items()):
-        if v == REFERENCE or (REFERENCE, s) not in preds:
+        r = REFERENCE_OF.get(v)
+        if r is None or (r, s) not in preds:
             continue
-        a = preds[(REFERENCE, s)]
+        a = preds[(r, s)]
         assert np.array_equal(a["row_id"].to_numpy(), d["row_id"].to_numpy())
         for sl, mask in _slices(meta, d["row_id"].to_numpy()).items():
             y, pv, pa = d["y_log"].to_numpy()[mask], d["pred_log"].to_numpy()[mask], a["pred_log"].to_numpy()[mask]
             crit = CRITERION_SLICE.get(v) == sl
             kw = dict(vectorized=True, B=BOOTSTRAP_B, seed=SEED, method="BCa" if crit else "percentile")
-            row = {"variant": v, "seed": s, "slice": sl, "criterion": crit, "n": len(y)}
+            row = {"variant": v, "reference": r, "seed": s, "slice": sl, "criterion": crit, "n": len(y)}
             row |= _ci_cols(st.paired_bootstrap_ci(st.rmsle, y, pv, pa, **kw), "d_rmsle")
             kw["method"] = "percentile"
             row |= _ci_cols(st.paired_bootstrap_ci(st.mdape, y, pv, pa, **kw), "d_mdape_pp")
             row |= _ci_cols(st.paired_bootstrap_ci(st.within25, y, pv, pa, **kw), "d_within25")
             row["ci_excludes_0"] = bool(row["d_rmsle_high"] < 0 or row["d_rmsle_low"] > 0)
             paired.append(row)
-            log.info("%s vs %s, seed %d, срез %s: ΔRMSLE %+.4f [%+.4f; %+.4f] (%s)", v, REFERENCE, s, sl,
+            log.info("%s vs %s, seed %d, срез %s: ΔRMSLE %+.4f [%+.4f; %+.4f] (%s)", v, r, s, sl,
                      row["d_rmsle"], row["d_rmsle_low"], row["d_rmsle_high"], row["d_rmsle_method"])
     paired = pd.DataFrame(paired)
     paired.to_csv(rep / "paired_vs_full.csv", index=False)
@@ -326,23 +336,25 @@ def report(meta, log, smoke: bool = False) -> None:
             d_rmsle_max=("d_rmsle", "max"), d_rmsle_high_max=("d_rmsle_high", "max"),
             d_rmsle_low_min=("d_rmsle_low", "min"), d_mdape_mean=("d_mdape_pp", "mean"),
             d_within25_mean=("d_within25", "mean")).reset_index()
+        decision["min_seeds"] = decision["variant"].map(MIN_SEEDS)
         decision["passes_rule"] = (decision["d_rmsle_mean"] <= DECISION_DELTA) & \
-                                  (decision["d_rmsle_high_max"] < 0) & (decision["n_seeds"] >= 3)
+                                  (decision["d_rmsle_high_max"] < 0) & (decision["n_seeds"] >= decision["min_seeds"])
         decision.to_csv(rep / "decision.csv", index=False)
 
     # разбивка по типу разрешения при seed 42 на срезе критерия
     by_type = []
     for v, sl in CRITERION_SLICE.items():
-        if (v, SEED) not in preds or (REFERENCE, SEED) not in preds:
+        r = REFERENCE_OF[v]
+        if (v, SEED) not in preds or (r, SEED) not in preds:
             continue
-        d, a = preds[(v, SEED)], preds[(REFERENCE, SEED)]
+        d, a = preds[(v, SEED)], preds[(r, SEED)]
         mask = _slices(meta, d["row_id"].to_numpy())[sl]
         g = meta.set_index("row_id").loc[d["row_id"].to_numpy(), "PERMIT_TYPE"].to_numpy()
         for t in np.unique(g):
             ix = mask & (g == t)
             y, pv, pa = d["y_log"].to_numpy()[ix], d["pred_log"].to_numpy()[ix], a["pred_log"].to_numpy()[ix]
-            row = {"variant": v, "slice": sl, "PERMIT_TYPE": t, "n": int(ix.sum()),
-                   f"rmsle_{REFERENCE}": float(st.rmsle(y, pa)), f"rmsle_{v}": float(st.rmsle(y, pv))}
+            row = {"variant": v, "reference": r, "slice": sl, "PERMIT_TYPE": t, "n": int(ix.sum()),
+                   "rmsle_reference": float(st.rmsle(y, pa)), "rmsle_variant": float(st.rmsle(y, pv))}
             row |= _ci_cols(st.paired_bootstrap_ci(st.rmsle, y, pv, pa, vectorized=True, B=BOOTSTRAP_B, seed=SEED,
                                                    method="percentile"), "d_rmsle")
             by_type.append(row)
@@ -357,15 +369,17 @@ def report(meta, log, smoke: bool = False) -> None:
 
 def write_summary(rep, res, paired, decision, by_type, ref, meta) -> None:
     _, _, info = split_val(meta)
-    txt = ["# Эксперимент label_cleaning: очистка служебных оценок (вариант A, val_hold)", "",
+    txt = ["# Эксперимент label_cleaning: очистка служебных оценок (варианты A и C96, val_hold)", "",
            "План — `docs/context/PLAN_LABEL_CLEANING.md`. Правило R2: VALUATION ∈ {$501, $301} ∪ {≤ $10}; "
            "R3 отброшен на шаге 0 (`step0_summary.json`, `r3_precision.csv`).",
            f"val_sel {info['sel_dates'][0]} … {info['sel_dates'][1]} — ранняя остановка и выбор эпохи "
-           f"(у A_noR2 без R2); val_hold {info['hold_dates'][0]} … {info['hold_dates'][1]} — только оценка. "
+           f"(у *_noR2 без R2); val_hold {info['hold_dates'][0]} … {info['hold_dates'][1]} — только оценка. "
            "Test не используется.",
-           "Срезы val_hold: full — все строки, noR2 — без служебных (критерий для A_noR2), onlyR2 — только служебные.",
-           "Парный bootstrap против A_full с тем же seed, B = 2000: ΔRMSLE на срезе критерия — BCa, "
-           "остальное — percentile (метод — в столбцах `*_method`).", ""]
+           "Срезы val_hold: full — все строки, noR2 — без служебных (критерий для *_noR2), onlyR2 — только служебные.",
+           "Парный bootstrap против эталона того же семейства (A_noR2 → A_full, C96_noR2 → C96_full) с тем же seed, "
+           "B = 2000: ΔRMSLE на срезе критерия — BCa, остальное — percentile (метод — в столбцах `*_method`).",
+           "Эталоны A_full (seed 43, 44) и C96_full взяты из text_tokens_holdout (`adopted_from` в metrics.json).",
+           ""]
     if ref:
         txt += [f"Проверка эталона: A_full seed 42 против text_tokens_holdout A — совпадение бит-в-бит: "
                 f"{ref['bitwise']} (max |Δ| = {ref['max_abs_diff']:.3g}).", ""]
@@ -373,13 +387,14 @@ def write_summary(rep, res, paired, decision, by_type, ref, meta) -> None:
             _md(res[["variant", "seed", "slice", "n", "rmsle", "mdape_pct", "within25", "best_epoch", "epochs_run",
                      "sel_rmsle", "n_train", "train_y_mean", "train_y_std"]])]
     if not paired.empty:
-        txt += ["", "## Парные сравнения с A_full", "",
-                _md(paired[["variant", "seed", "slice", "criterion", "n", "d_rmsle", "d_rmsle_low", "d_rmsle_high",
+        txt += ["", "## Парные сравнения с эталоном", "",
+                _md(paired[["variant", "reference", "seed", "slice", "criterion", "n", "d_rmsle", "d_rmsle_low", "d_rmsle_high",
                             "d_rmsle_method", "d_mdape_pp", "d_within25", "ci_excludes_0"]])]
     if not decision.empty:
         txt += ["", "## Правило решения", "",
                 f"Средний ΔRMSLE по seed ≤ {DECISION_DELTA} и CI не содержит 0 при каждом seed — "
-                "на собственном очищенном срезе варианта.", "", _md(decision), ""]
+                "на собственном очищенном срезе варианта; минимум seed: A — 3, C96 — 2 (`min_seeds`).", "",
+                _md(decision), ""]
         for _, r in decision.iterrows():
             txt.append(f"- {r['variant']} (срез {r['slice']}): средний ΔRMSLE {r['d_rmsle_mean']:+.4f} "
                        f"(min–max {r['d_rmsle_min']:+.4f}…{r['d_rmsle_max']:+.4f}) — "
@@ -412,16 +427,16 @@ def main() -> None:
     log.info("устройство: %s", device_name(device))
     meta, X, prep = load_features(log=log)
     log.info("разбиение val: %s", split_val(meta)[2])
-    variants = ["A_full", "A_noR2"] if args.smoke else [x.strip() for x in args.variants.split(",") if x.strip()]
+    variants = [x.strip() for x in args.variants.split(",") if x.strip()]
     seeds = [SEED] if args.smoke else [int(x) for x in args.seeds.split(",") if x.strip()]
     if not args.report:
         for v in variants:
             if v not in VARIANTS:
                 raise ValueError(f"неизвестный вариант {v}; есть {list(VARIANTS)}")
-            # seed 42 первым: от его совпадения с text_tokens_holdout зависит, переобучать ли A_full для 43, 44
+            # seed 42 первым: от совпадения A_full seed 42 с text_tokens_holdout зависит, брать ли оттуда эталоны
             for s in sorted(seeds, key=lambda x: x != SEED):
-                if v == REFERENCE and s != SEED and not args.smoke and not args.force and \
-                        adopt_reference(s, meta, log):
+                adoptable = v.endswith("_full") and not (v == REFERENCE and s == SEED)
+                if adoptable and not args.smoke and not args.force and adopt_reference(v, s, meta, log):
                     continue
                 run(v, s, meta, X, prep, device, log, args.smoke, args.force)
                 if device.type == "cuda":
