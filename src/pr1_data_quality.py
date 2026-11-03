@@ -1311,7 +1311,32 @@ def section_anomalies(ctx: Ctx) -> list[dict]:
                     "ci_method": ci.method, "n": int(s.sum())})
     save_table(pd.DataFrame(eff), "anomalies_error")
 
-    idx = np.flatnonzero(tr)[np.argsort(score[tr])[:15]]
+    # кто попадает в аномалии: доля признака среди аномалий и среди остальных (по частям)
+    adu = c["work_desc"].str.lower().str.contains(DRIFT_PATTERNS["ADU / accessory dwelling"], regex=True).to_numpy()
+    traits = {f"PERMIT_TYPE = {t}": (c["PERMIT_TYPE"] == t).to_numpy() for t in sorted(c["PERMIT_TYPE"].unique())}
+    traits["ADU в описании работ"] = adu
+    traits["площадь заполнена"] = c["square_footage"].notna().to_numpy()
+    prof = []
+    for part in ("train", "test"):
+        m = split == part
+        for name, hit in traits.items():
+            prof.append(wilson_row(name, hit, m & anom, часть=part, группа="аномалии"))
+            prof.append(wilson_row(name, hit, m & ~anom, часть=part, группа="остальные"))
+        prof.append(wilson_row("доля аномалий среди строк с ADU", anom, m & adu, часть=part, группа="—"))
+        prof.append(wilson_row("доля аномалий среди строк без ADU", anom, m & ~adu, часть=part, группа="—"))
+    save_table(pd.DataFrame(prof), "anomalies_profile")
+
+    # ошибка на аномалиях внутри каждого типа: эффект не сводится к составу по типам
+    eff_t = []
+    for t in sorted(c["PERMIT_TYPE"].unique()):
+        for name, mm in (("аномалии IsolationForest", anom), ("остальные", ~anom)):
+            s = te & mm & (c["PERMIT_TYPE"] == t).to_numpy()
+            ci = st.bootstrap_ci(st.rmsle, y[s], p[s], vectorized=True)
+            eff_t.append({"PERMIT_TYPE": t, "группа test": name, "rmsle": ci.estimate, "ci_low": ci.low,
+                          "ci_high": ci.high, "ci_method": ci.method, "n": int(s.sum())})
+    save_table(pd.DataFrame(eff_t), "anomalies_error_by_type")
+
+    idx = tr[np.argsort(score[tr])[:15]]  # tr — уже номера строк train
     save_table(pd.DataFrame({
         "PERMIT_NBR": c["PERMIT_NBR"].to_numpy()[idx], "PERMIT_TYPE": c["PERMIT_TYPE"].to_numpy()[idx],
         "USE_DESC": c["USE_DESC"].to_numpy()[idx], "SQUARE_FOOTAGE": c["square_footage"].to_numpy()[idx],

@@ -11,3 +11,4 @@ datasketch>=1.6
 tqdm>=4.66
 jupyter>=1.1
 ipykernel>=6.29
+python-pptx>=1.0
