@@ -41,6 +41,7 @@ import torch  # noqa: E402
 
 import stats as st  # noqa: E402
 from config import ARTIFACTS_DIR, BOOTSTRAP_B, REPORTS_DIR, SEED  # noqa: E402
+from data import SERVICE_MAX, SERVICE_VALUES, service_mask  # noqa: E402  (R2 — общая функция, с 2026-11-03 в data.py)
 from model import DEFAULT_HP  # noqa: E402
 from text_tokens import DECISION_DELTA, _md  # noqa: E402
 from text_tokens_holdout import HOLD_DIR, inputs, split_val  # noqa: E402
@@ -51,8 +52,6 @@ EXP_DIR = ARTIFACTS_DIR / "experiments" / "label_cleaning"
 REP_DIR = REPORTS_DIR / "experiments" / "label_cleaning"
 LOG_PATH = ARTIFACTS_DIR / "logs" / "label_cleaning.log"
 
-SERVICE_VALUES = (501.0, 301.0)  # служебные оценки (ПР1: $501 — 7,7% меток)
-SERVICE_MAX = 10.0               # оценки ≤ $10 ($1 и т. п.) — тоже служебные
 
 # Исходная регулярка R3 из плана: слова для разметки на шаге 0 (сработавшее слово → выборка)
 R3_WORDS = {"supplement": r"supplement", "fee": r"\bfees?\b", "capture": r"capture",
@@ -76,12 +75,6 @@ CRITERION_SLICE = {"A_noR2": "noR2", "C96_noR2": "noR2"}
 MIN_SEEDS = {"A_noR2": 3, "C96_noR2": 2}
 REFERENCE = "A_full"  # эталон, воспроизводимость которого проверяется бит-в-бит
 SMOKE_ROWS = 5000
-
-
-def service_mask(valuation: np.ndarray) -> np.ndarray:
-    """R2: служебные значения VALUATION. Общая функция для эксперимента и (при принятии) для data.py."""
-    v = np.asarray(valuation, dtype=float)
-    return np.isin(np.round(v, 6), SERVICE_VALUES) | (v <= SERVICE_MAX + 1e-9)
 
 
 def rule_mask(rule: str | None, meta) -> np.ndarray:

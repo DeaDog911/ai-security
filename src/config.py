@@ -27,6 +27,13 @@ REPORTS_DIR = PROJECT_ROOT / "reports"
 SEED = 42
 BOOTSTRAP_B = 2000
 
+# Baseline. R2 принят 2026-11-03 (решение пользователя): служебные оценки (data.service_mask) не участвуют
+# ни в обучении, ни в оценке; split не меняется. Числовые признаки — режимы features.Preprocessor
+# (эксперимент time_clip); у препроцессора с другими режимами числа пересчитываются в load_features.
+EXCLUDE_SERVICE = True
+BASELINE_TIME_MODE = "year_clip"
+BASELINE_CLIP_MODE = "quantile"
+
 
 def require_dataset() -> dict[str, Path]:
     """Пути к обоим файлам датасета или объяснение, где их взять."""

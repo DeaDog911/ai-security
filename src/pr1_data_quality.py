@@ -17,10 +17,12 @@ near_duplicate_pairs.parquet, pr1_cls_embeddings.npz) и без --force не п�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 
 import time
+from pathlib import Path
 
 import matplotlib
 
@@ -32,9 +34,11 @@ import torch  # noqa: E402
 from scipy import stats as sps  # noqa: E402
 
 import stats as st  # noqa: E402
-from config import ARTIFACTS_DIR, BOOTSTRAP_B, DATASETS, REPORTS_DIR, SEED  # noqa: E402
-from data import ID_COLS, PERMIT_TYPES, SPLIT_INFO_PATH, load_dataset, load_parsed, raw_columns  # noqa: E402
-from features import CAT_COLS, EXCLUDED, normalize_text  # noqa: E402
+from config import (ARTIFACTS_DIR, BASELINE_CLIP_MODE, BASELINE_TIME_MODE, BOOTSTRAP_B, DATASETS,  # noqa: E402
+                    EXCLUDE_SERVICE, REPORTS_DIR, SEED)
+from data import (ID_COLS, PERMIT_TYPES, SPLIT_INFO_PATH, load_dataset, load_parsed, raw_columns,  # noqa: E402
+                  service_mask)
+from features import CAT_COLS, EXCLUDED, LA_BBOX, TEXT_COL, normalize_text, word_tokenize  # noqa: E402
 from model import DEFAULT_HP  # noqa: E402
 from train_baseline import MODEL_PATH, PRED_PATH, get_logger, load_features  # noqa: E402
 from training import TRAIN_HP, build_model, embed, fit, get_device, predict, set_seed  # noqa: E402
@@ -45,6 +49,11 @@ OOF_HIST_PATH = ARTIFACTS_DIR / "oof_history.csv"
 MINHASH_PATH = ARTIFACTS_DIR / "minhash_signatures.npy"
 PAIRS_PATH = ARTIFACTS_DIR / "near_duplicate_pairs.parquet"
 CLS_PATH = ARTIFACTS_DIR / "pr1_cls_embeddings.npz"
+OOF_META_PATH = ARTIFACTS_DIR / "oof_predictions.json"  # с какими настройками посчитан кеш OOF
+# прежний baseline для сравнения критерия меток (архив его OOF)
+MODEL_NAME = "C96 без R2 (текущий baseline)"
+OLD_MODEL_NAME = "C96 с R2 (прежний baseline)"
+OLD_OOF_PATH = ARTIFACTS_DIR / "baseline_c96" / "oof_predictions.parquet"
 
 Z_THRESHOLD = 3.5            # Iglewicz–Hoaglin
 CLEANLAB_K = 100             # соседей в OUTRE (cleanlab.regression)
@@ -57,8 +66,8 @@ N_FOLDS = 5
 MMD_N = 5000
 MMD_PERM = 1000
 C2ST_N = 20000
-LA_BBOX = {"lat": (33.70, 34.34), "lon": (-118.67, -118.15)}  # город Лос-Анджелес с запасом
-TIME_FEATURES = {"issue_year", "issue_month", "issue_dow", "issue_doy"}
+TIME_FEATURES = {"issue_year", "issue_month", "issue_dow", "issue_doy",  # time_mode="year_clip"
+                 "t", "month_sin", "month_cos", "doy_sin", "doy_cos"}  # time_mode="continuous"
 SPLITS = ("train", "val", "test")
 
 log = logging.getLogger("ai-security")
@@ -148,6 +157,14 @@ class Ctx:
         return np.log1p(self.clean["valuation"].to_numpy())
 
     @property
+    def service(self) -> np.ndarray:  # служебные оценки R2 (data.service_mask)
+        return self._get("service", lambda: service_mask(self.clean["valuation"].to_numpy()))
+
+    @property
+    def task(self) -> np.ndarray:  # строки постановки задачи: на них считаются метрики модели
+        return ~self.service if EXCLUDE_SERVICE else np.ones(len(self.clean), bool)
+
+    @property
     def preds(self) -> pd.DataFrame:  # прогнозы baseline (log1p), выровненные по clean
         def f():
             p = pd.read_parquet(PRED_PATH).set_index("row_id")
@@ -174,6 +191,9 @@ def section_describe(ctx: Ctx) -> None:
         ("Исключено: VALUATION пусто / ≤ 0", f"{info['n_valuation_nan']:,} / {info['n_valuation_le0']:,}"),
         ("Исключено: дубли без учёта ID", f"{info['n_dup_without_id_removed']:,}"),
         ("Строк для обучения", f"{info['n_clean']:,}"),
+        ("Служебные оценки R2 (VALUATION ∈ {$501, $301} ∪ {≤ $10})",
+         ("исключены из обучения и оценки модели: " if EXCLUDE_SERVICE else "не исключаются: ")
+         + ", ".join(f"{p} {int(ctx.service[ctx.split == p].sum()):,}" for p in SPLITS)),
         ("Признаки модели", f"{len(s['num_features'])} числовых, {len(s['cat_features'])} категориальных, "
                             f"текст → SVD(64){words_txt}; всего токенов {n_tokens}"),
         ("Исходных столбцов", f"{len(raw_columns(ctx.raw))}"),
@@ -314,7 +334,7 @@ def section_validity(ctx: Ctx) -> list[dict]:
         ("DU_CHANGED < 0 у Bldg-New", sc["du_changed"] < 0, (t == "Bldg-New") & sc["du_changed"].notna(),
          "предметная область"),
         ("ISSUE_DATE < SUBMITTED_DATE", sc["issue_date"] < sc["submitted_date"], sc["submitted_date"].notna(), "даты"),
-        ("STATUS_DATE < ISSUE_DATE", sc["status_date"] < sc["issue_date"], None, "даты"),
+        ("STATUS_DATE < ISSUE_DATE", sc["status_date"] < sc["issue_date"], sc["status_date"].notna(), "даты"),
         ("COFO_DATE < ISSUE_DATE", sc["cofo_date"] < sc["issue_date"], sc["cofo_date"].notna(), "даты"),
         ("координаты вне bbox Лос-Анджелеса (из заполненных)", out_bbox, has_coord, "диапазон"),
         ("координаты пропущены", ~has_coord, None, "полнота/формат"),
@@ -322,7 +342,8 @@ def section_validity(ctx: Ctx) -> list[dict]:
         ("ZONE содержит несколько значений", sc["ZONE"].fillna("").str.contains(","), None, "формат"),
         ("CT содержит несколько значений", sc["CT"].fillna("").str.contains(","), None, "формат"),
         ("HL вне {YES, NO} (из заполненных)", ~sc["HL"].isin(["YES", "NO"]), sc["HL"].notna(), "формат"),
-        ("ZIP_CODE не из 5 цифр", ~sc["ZIP_CODE"].fillna("").str.fullmatch(r"\d{5}"), None, "формат"),
+        ("ZIP_CODE не из 5 цифр (из заполненных)", ~sc["ZIP_CODE"].str.fullmatch(r"\d{5}").astype("boolean"),
+         sc["ZIP_CODE"].notna(), "формат"),  # пустой ZIP — пропуск (completeness), не нарушение формата
     ]
     rows, any_viol = [], np.zeros(n, bool)
     for name, mask, denom, kind in checks:
@@ -393,6 +414,10 @@ def masked_apn(ctx: Ctx) -> np.ndarray:
 
 
 def near_duplicate_pairs(ctx: Ctx) -> pd.DataFrame:
+    return ctx._get("pairs", lambda: _near_duplicate_pairs(ctx))  # один раз за запуск
+
+
+def _near_duplicate_pairs(ctx: Ctx) -> pd.DataFrame:
     """Пары строк clean на одном участке (APN) с оценкой Jaccard текста ≥ 0,9."""
     if PAIRS_PATH.exists() and not ctx.force:
         return pd.read_parquet(PAIRS_PATH)
@@ -634,15 +659,45 @@ def section_balance(ctx: Ctx) -> list[dict]:
 
 
 # ====================================================================== 7. качество меток
+def file_md5(path) -> str:
+    return hashlib.md5(Path(path).read_bytes()).hexdigest()
+
+
+def check_cache(path, meta_now: dict, saved: dict | None) -> None:
+    """Кеш посчитан для другой модели или настроек — ошибка, а не тихое использование устаревших чисел."""
+    if saved != meta_now:
+        raise RuntimeError(f"кеш {path} посчитан для других настроек ({saved} ≠ {meta_now}); "
+                           "запустите с --force")
+
+
+def oof_meta() -> dict:
+    return {"exclude_service": EXCLUDE_SERVICE, "time_mode": BASELINE_TIME_MODE, "clip_mode": BASELINE_CLIP_MODE,
+            "n_folds": N_FOLDS, "seed": SEED}
+
+
 def compute_oof(ctx: Ctx) -> pd.DataFrame:
-    """OOF-прогнозы на train: 5-fold, гиперпараметры baseline, early stopping по val (как у baseline)."""
+    """OOF один раз за запуск (с --force нужен labels и shift, а пересчитывать его дважды — ≈ 2,5 ч)."""
+    return ctx._get("oof", lambda: _compute_oof(ctx))
+
+
+def _compute_oof(ctx: Ctx) -> pd.DataFrame:
+    """OOF-прогнозы на train: 5-fold, гиперпараметры baseline, early stopping по val (как у baseline).
+
+    Фолды — KFold по всем строкам train; обучение и early stopping — только на строках постановки задачи
+    (без R2, как у baseline), прогноз — для всех отложенных строк, включая служебные.
+    """
     if OOF_PATH.exists() and not ctx.force:
+        saved = json.loads(OOF_META_PATH.read_text(encoding="utf-8")) if OOF_META_PATH.exists() else None
+        check_cache(OOF_PATH, oof_meta(), saved)
         return pd.read_parquet(OOF_PATH)
     from sklearn.model_selection import KFold
     meta, X, prep = ctx.feats
     split = meta["split"].to_numpy()
     y = meta["y_log"].to_numpy()
     tr, va = np.flatnonzero(split == "train"), np.flatnonzero(split == "val")
+    task = ctx.task
+    assert np.array_equal(meta["row_id"].to_numpy(), ctx.clean["row_id"].to_numpy())
+    va = va[task[va]]
     sub = lambda ix: {k: v[ix] for k, v in X.items()}  # noqa: E731
     device = get_device()
     oof = np.full(len(tr), np.nan)
@@ -650,7 +705,8 @@ def compute_oof(ctx: Ctx) -> pd.DataFrame:
     hist = []
     for f, (a, b) in enumerate(KFold(N_FOLDS, shuffle=True, random_state=SEED).split(tr)):
         t0 = time.perf_counter()
-        log.info("OOF fold %d/%d: train %d, held-out %d", f + 1, N_FOLDS, len(a), len(b))
+        a = a[task[tr[a]]]
+        log.info("OOF fold %d/%d: train %d (без R2), val %d, held-out %d", f + 1, N_FOLDS, len(a), len(va), len(b))
         set_seed(SEED)
         model = build_model(X, prep.cat_cardinalities, DEFAULT_HP, **prep.model_kw)
         model, h, best = fit(model, sub(tr[a]), (y[tr[a]] - prep.y_mean) / prep.y_std, sub(va), y[va],
@@ -658,13 +714,15 @@ def compute_oof(ctx: Ctx) -> pd.DataFrame:
         oof[b] = predict(model, sub(tr[b]), device) * prep.y_std + prep.y_mean
         fold[b] = f
         hist += [{**r, "fold": f, "best_epoch": best} for r in h]
-        log.info("OOF fold %d: RMSLE held-out %.4f, %.0f с", f + 1, st.rmsle(y[tr[b]], oof[b]),
+        bt = b[task[tr[b]]]
+        log.info("OOF fold %d: RMSLE held-out (без R2) %.4f, %.0f с", f + 1, st.rmsle(y[tr[bt]], oof[bt]),
                  time.perf_counter() - t0)
         del model
         torch.cuda.empty_cache()
     out = pd.DataFrame({"row_id": meta["row_id"].to_numpy()[tr], "fold": fold, "y_log": y[tr], "oof_log": oof})
     out.to_parquet(OOF_PATH, index=False)
     pd.DataFrame(hist).to_csv(OOF_HIST_PATH, index=False)
+    OOF_META_PATH.write_text(json.dumps(oof_meta(), ensure_ascii=False), encoding="utf-8")
     return out
 
 
@@ -684,35 +742,44 @@ def section_labels(ctx: Ctx) -> list[dict]:
     pred[tr] = oof["oof_log"].to_numpy()
     y = ctx.y_log
     r = y - pred
+    # метрики модели — на строках постановки задачи (без R2): медиана и MAD остатков по ним же;
+    # служебным строкам z считается с тем же порогом (отдельная строка «подозрительные среди служебных»)
+    ok, service = ctx.task, ctx.service
     z = np.empty_like(r)
     zinfo = {}
     for part in SPLITS:
         m = split == part
-        z[m], med, mad = robust_z(r[m])
+        _, med, mad = robust_z(r[m & ok])
+        z[m] = 0.6745 * (r[m] - med) / mad
         zinfo[part] = {"median_r": med, "MAD_r": mad}
-    susp = np.abs(z) > Z_THRESHOLD
+    susp_all = np.abs(z) > Z_THRESHOLD
+    susp = susp_all & ok
     big = np.abs(r) > BIG_RESIDUAL
     ptype = c["PERMIT_TYPE"].to_numpy()
 
     rows = []
     for part in SPLITS:
         m = split == part
+        mo = m & ok
         src = "OOF 5-fold" if part == "train" else "baseline"
-        rows.append(wilson_row(f"|robust z| > {Z_THRESHOLD}", susp, m, часть=part, прогноз=src, **zinfo[part]))
-        rows.append(wilson_row("|r| > ln 10 (ошибка > 10 раз)", big, m, часть=part, прогноз=src))
-        rows.append(wilson_row("  из них прогноз выше метки (метка занижена?)", (r < 0) & susp, m & susp, часть=part,
+        rows.append(wilson_row(f"|robust z| > {Z_THRESHOLD}", susp, mo, часть=part, прогноз=src, **zinfo[part]))
+        rows.append(wilson_row("|r| > ln 10 (ошибка > 10 раз)", big, mo, часть=part, прогноз=src))
+        rows.append(wilson_row("  из них прогноз выше метки (метка занижена?)", (r < 0) & susp, mo & susp, часть=part,
                                прогноз=src))
         for t in PERMIT_TYPES:
-            rows.append(wilson_row(f"|robust z| > {Z_THRESHOLD}, {t}", susp, m & (ptype == t), часть=part, прогноз=src))
+            rows.append(wilson_row(f"|robust z| > {Z_THRESHOLD}, {t}", susp, mo & (ptype == t), часть=part, прогноз=src))
+        rows.append(wilson_row("служебные оценки R2 (исключены из метрик модели)", service, m, часть=part, прогноз=src))
+        rows.append(wilson_row(f"|robust z| > {Z_THRESHOLD} среди служебных (порог — по строкам без R2)", susp_all,
+                               m & service, часть=part, прогноз=src))
     tab = pd.DataFrame(rows)
     save_table(tab, "labels_suspicious")
 
     # качество OOF-прогноза (стратифицированный по PERMIT_TYPE bootstrap)
-    m = tr
+    m = tr & ok
     oof_rmsle = st.stratified_bootstrap_ci(st.rmsle, y[m], pred[m], strata=ptype[m], vectorized=True)
     oof_mdape = st.stratified_bootstrap_ci(st.mdape, y[m], pred[m], strata=ptype[m], vectorized=True)
-    save_table(pd.DataFrame([{"метрика": "RMSLE OOF (train)", **ci_cols(oof_rmsle)},
-                             {"метрика": "MdAPE OOF (train), %", **ci_cols(oof_mdape)}]), "labels_oof_quality")
+    save_table(pd.DataFrame([{"метрика": "RMSLE OOF (train без R2)", **ci_cols(oof_rmsle)},
+                             {"метрика": "MdAPE OOF (train без R2), %", **ci_cols(oof_mdape)}]), "labels_oof_quality")
 
     # cleanlab: label quality score (регрессия) на OOF
     # Метод OUTRE (по умолчанию в cleanlab.regression) строит kNN с k = 0,5·n: для n ≈ 5·10⁵
@@ -727,14 +794,14 @@ def section_labels(ctx: Ctx) -> list[dict]:
     rho = sps.spearmanr(lq, -np.abs(r[m])).statistic
     lq_mean = st.bootstrap_ci(st.mean_stat, lq, vectorized=True)
     save_table(pd.DataFrame([
-        {"метрика": "средний label quality score (cleanlab, OOF)", **ci_cols(lq_mean)},
+        {"метрика": "средний label quality score (cleanlab, OOF, train без R2)", **ci_cols(lq_mean)},
         {"метрика": f"пересечение {k} худших по cleanlab и по |z|", "value": overlap},
         {"метрика": "Spearman(score, −|r|)", "value": rho},
         {"метрика": "доля score < 0,1", **ci_cols(st.proportion_ci(lq < 0.1))},
     ]), "labels_cleanlab")
     log.info("cleanlab: %.0f с, пересечение %.3f", time.perf_counter() - t0, overlap)
 
-    # служебные и округлённые значения
+    # служебные и округлённые значения (данные — по всем строкам)
     v = c["valuation"].to_numpy()
     top = c["valuation"].value_counts().head(15)
     save_table(pd.DataFrame({"VALUATION": top.index, "k": top.to_numpy(), "доля": top.to_numpy() / len(c)}),
@@ -742,12 +809,13 @@ def section_labels(ctx: Ctx) -> list[dict]:
     v501 = v == 501
     svc = [
         wilson_row("VALUATION = $501", v501),
+        wilson_row("служебные оценки R2: {$501, $301} ∪ {≤ $10}", service),
         wilson_row("VALUATION ≤ $100", v <= 100),
         wilson_row("VALUATION кратна $1 000", np.isclose(v % 1000, 0)),
         wilson_row("VALUATION кратна $5 000", np.isclose(v % 5000, 0)),
-        wilson_row("подозрительные (|z| > 3,5) среди $501, train", susp, tr & v501),
-        wilson_row("подозрительные (|z| > 3,5) среди остальных, train", susp, tr & ~v501),
-        wilson_row("доля $501 среди подозрительных, train", v501, tr & susp),
+        wilson_row(f"|robust z| > {Z_THRESHOLD} среди служебных, train (порог — по строкам без R2)", susp_all,
+                   tr & service),
+        wilson_row(f"|robust z| > {Z_THRESHOLD} среди несервисных, train", susp_all, tr & ~service),
     ]
     save_table(pd.DataFrame(svc), "labels_service_values")
 
@@ -766,8 +834,9 @@ def section_labels(ctx: Ctx) -> list[dict]:
     for x in (a, b):
         other[x[diff]] = True
         same[x[~diff]] = True
-    groups = {"близкий дубль в другом фолде": tr & other, "близкий дубль только в том же фолде": tr & same & ~other,
-              "без близкого дубля в train": tr & ~other & ~same}
+    tro = tr & ok
+    groups = {"близкий дубль в другом фолде": tro & other, "близкий дубль только в том же фолде": tro & same & ~other,
+              "без близкого дубля в train": tro & ~other & ~same}
     diag = []
     for name, g in groups.items():
         abs_r = np.abs(r[g])
@@ -776,69 +845,82 @@ def section_labels(ctx: Ctx) -> list[dict]:
                      **ci_cols(st.proportion_ci(susp[g]), "susp_")})
     save_table(pd.DataFrame(diag), "labels_oof_neardup")
 
-    # зависимость критерия от модели: сравнение с прежним baseline (SVD(64), архив artifacts/baseline_svd64/)
-    old_path = ARTIFACTS_DIR / "baseline_svd64" / OOF_PATH.name
-    if old_path.exists():
-        old = pd.read_parquet(old_path)
+    # зависимость критерия от модели: сравнение с прежним baseline на тех же строках train без R2
+    # (OOF прежнего C96 — архив artifacts/baseline_c96/, фолды те же)
+    if OLD_OOF_PATH.exists():
+        old = pd.read_parquet(OLD_OOF_PATH)
         assert np.array_equal(old["row_id"].to_numpy(), oof["row_id"].to_numpy())
-        r_new, r_old = r[tr], (old["y_log"] - old["oof_log"]).to_numpy()
+        assert np.array_equal(old["fold"].to_numpy(), oof["fold"].to_numpy())
+        r_old_all = (old["y_log"] - old["oof_log"]).to_numpy()
+        z_old_all, med_prev, mad_prev = robust_z(r_old_all)  # как в прежнем отчёте: по всем строкам train
+        thr_prev = Z_THRESHOLD * mad_prev / 0.6745             # прежний порог |r − median| в log-единицах
+        ok_tr = ok[tr]
+        r_new, r_old = r[tr][ok_tr], r_old_all[ok_tr]
         z_old, med_old, mad_old = robust_z(r_old)
         med_new, mad_new = zinfo["train"]["median_r"], zinfo["train"]["MAD_r"]
-        thr_old = Z_THRESHOLD * mad_old / 0.6745  # порог |r − median| прежней модели в log-единицах
-        s_new, s_old = np.abs(z[tr]) > Z_THRESHOLD, np.abs(z_old) > Z_THRESHOLD
+        s_new, s_old = np.abs(z[tr][ok_tr]) > Z_THRESHOLD, np.abs(z_old) > Z_THRESHOLD
+        jac = float((s_new & s_old).sum() / (s_new | s_old).sum())
         dep = []
-        for name, mad, med, s, rr in (("C96 (текущий baseline)", mad_new, med_new, s_new, r_new),
-                                      ("SVD(64) (прежний baseline)", mad_old, med_old, s_old, r_old)):
+        for name, mad, med, s, rr in ((MODEL_NAME, mad_new, med_new, s_new, r_new),
+                                      (OLD_MODEL_NAME, mad_old, med_old, s_old, r_old)):
             thr = Z_THRESHOLD * mad / 0.6745
-            dep.append({"модель": name, "MAD остатков": mad, "порог |r − median|, log": thr,
+            dep.append({"модель": name, "строки": "train без R2", "MAD остатков": mad, "порог |r − median|, log": thr,
                         "порог, раз": float(np.exp(thr)), **ci_cols(st.proportion_ci(s), "susp_"),
-                        **ci_cols(st.proportion_ci(np.abs(rr - med) > thr_old), "susp_old_abs_thr_"),
+                        **ci_cols(st.proportion_ci(np.abs(rr - med) > thr_prev), "susp_prev_abs_thr_"),
                         **ci_cols(st.proportion_ci(np.abs(rr) > BIG_RESIDUAL), "big_"),
-                        "доля квадратичной ошибки у подозрительных": float((rr[s] ** 2).sum() / (rr ** 2).sum())})
-        dep.append({"модель": "Jaccard наборов подозрительных (C96 vs SVD(64))",
-                    "MAD остатков": (s_new & s_old).sum() / (s_new | s_old).sum()})
+                        "доля квадратичной ошибки у подозрительных": float((rr[s] ** 2).sum() / (rr ** 2).sum()),
+                        "jaccard_susp": jac})
+        dep.append({"модель": f"{OLD_MODEL_NAME}, прежний отчёт", "строки": "весь train", "MAD остатков": mad_prev,
+                    "порог |r − median|, log": thr_prev, "порог, раз": float(np.exp(thr_prev)),
+                    **ci_cols(st.proportion_ci(np.abs(z_old_all) > Z_THRESHOLD), "susp_"),
+                    **ci_cols(st.proportion_ci(np.abs(r_old_all) > BIG_RESIDUAL), "big_")})
         save_table(pd.DataFrame(dep), "labels_model_dependence")
-        # прежние 20 худших: насколько изменились прогноз и z
-        top = np.argsort(-np.abs(z_old))[:20]
+        # 20 худших прежнего отчёта: насколько изменились прогноз и z
+        top = np.argsort(-np.abs(z_old_all))[:20]
+        p_old = np.expm1(old["oof_log"].to_numpy()[top])
         save_table(pd.DataFrame({
             "PERMIT_NBR": c.loc[tr, "PERMIT_NBR"].to_numpy()[top], "VALUATION": c.loc[tr, "valuation"].to_numpy()[top],
-            "прогноз SVD(64) $": np.expm1(old["oof_log"].to_numpy()[top]).round(),
-            "прогноз C96 $": np.expm1(pred[tr][top]).round(),
-            "C96 / SVD(64)": np.expm1(pred[tr][top]) / np.expm1(old["oof_log"].to_numpy()[top]),
-            "z SVD(64)": z_old[top], "z C96": z[tr][top],
+            "служебная (R2)": service[tr][top],
+            f"прогноз {OLD_MODEL_NAME} $": p_old.round(), f"прогноз {MODEL_NAME} $": np.expm1(pred[tr][top]).round(),
+            "новый / прежний": np.expm1(pred[tr][top]) / p_old,
+            "z прежний": z_old_all[top], "z новый": z[tr][top],
             "WORK_DESC": c.loc[tr, "work_desc"].str[:120].to_numpy()[top]}), "labels_prev_worst20")
 
-    # 20 худших примеров train (для ручного разбора)
-    idx = np.flatnonzero(tr)[np.argsort(-np.abs(z[tr]))[:20]]
+    # 20 худших примеров train без R2 (для ручного разбора)
+    tro_idx = np.flatnonzero(tro)
+    order = np.argsort(-np.abs(z[tro_idx]))[:20]
+    idx = tro_idx[order]
     worst = pd.DataFrame({
         "PERMIT_NBR": c["PERMIT_NBR"].to_numpy()[idx], "ISSUE_DATE": c["issue_date"].dt.date.to_numpy()[idx],
         "PERMIT_TYPE": ptype[idx], "SUB_TYPE": c["PERMIT_SUB_TYPE"].to_numpy()[idx],
         "USE_DESC": c["USE_DESC"].to_numpy()[idx], "SQUARE_FOOTAGE": c["square_footage"].to_numpy()[idx],
         "VALUATION": v[idx], "OOF прогноз $": np.round(np.expm1(pred[idx])),
-        "прогноз/метка": np.expm1(pred[idx]) / v[idx], "z": z[idx], "cleanlab score": lq[np.argsort(-np.abs(z[tr]))[:20]],
+        "прогноз/метка": np.expm1(pred[idx]) / v[idx], "z": z[idx], "cleanlab score": lq[order],
         "WORK_DESC": c["work_desc"].str.slice(0, 220).to_numpy()[idx],
     })
     save_table(worst, "labels_worst20")
-    pd.DataFrame({"row_id": c["row_id"], "split": split, "residual": r, "robust_z": z,
+    pd.DataFrame({"row_id": c["row_id"], "split": split, "residual": r, "robust_z": z, "service": service,
                   "suspicious": susp}).to_parquet(ARTIFACTS_DIR / "pr1_label_residuals.parquet", index=False)
 
     fig, ax = plt.subplots(1, 3, figsize=(16, 4.5))
-    ax[0].hist(z[tr], bins=np.linspace(-12, 12, 241), color="C0")
+    ax[0].hist(z[tro], bins=np.linspace(-12, 12, 241), color="C0")
     ax[0].axvline(-Z_THRESHOLD, color="r", ls="--")
     ax[0].axvline(Z_THRESHOLD, color="r", ls="--", label=f"|z| = {Z_THRESHOLD}")
-    ax[0].set(yscale="log", xlabel="robust z остатка (train, OOF)", ylabel="число объектов",
+    ax[0].set(yscale="log", xlabel="robust z остатка (train без R2, OOF)", ylabel="число объектов",
               title="Остатки OOF в robust z")
     ax[0].legend()
-    hb = ax[1].hexbin(pred[tr], y[tr], gridsize=80, bins="log", cmap="viridis", mincnt=1)
+    hb = ax[1].hexbin(pred[tro], y[tro], gridsize=80, bins="log", cmap="viridis", mincnt=1)
     lim = [0, 20]
     ax[1].plot(lim, lim, "w--", lw=1)
-    ax[1].set(xlim=lim, ylim=lim, xlabel="OOF прогноз log1p", ylabel="метка log1p", title="Метка vs OOF прогноз (train)")
+    ax[1].set(xlim=lim, ylim=lim, xlabel="OOF прогноз log1p", ylabel="метка log1p",
+              title="Метка vs OOF прогноз (train без R2)")
     fig.colorbar(hb, ax=ax[1], fraction=0.04)
     yrs = c["issue_date"].dt.year.to_numpy()
-    yr = pd.DataFrame({"год": yrs, "susp": susp, "s501": v501}).groupby("год").mean()
-    ax[2].plot(yr.index, yr["susp"] * 100, "o-", label="подозрительные метки")
-    ax[2].plot(yr.index, yr["s501"] * 100, "s-", label="$501")
-    ax[2].set(xlabel="год выдачи", ylabel="%", title="Доля подозрительных меток и $501 по годам")
+    yr_susp = pd.Series(susp[ok]).groupby(yrs[ok]).mean()
+    yr_svc = pd.Series(service).groupby(yrs).mean()
+    ax[2].plot(yr_susp.index, yr_susp * 100, "o-", label="подозрительные метки (среди строк без R2)")
+    ax[2].plot(yr_svc.index, yr_svc * 100, "s-", label="служебные оценки R2 (среди всех строк)")
+    ax[2].set(xlabel="год выдачи", ylabel="%", title="Доля подозрительных меток и служебных оценок по годам")
     ax[2].legend()
     ax[2].grid(alpha=0.3)
     save_fig(fig, "labels")
@@ -846,16 +928,18 @@ def section_labels(ctx: Ctx) -> list[dict]:
     t = tab[(tab["часть"] == "train")].set_index("check")
     to_ci = lambda row: st.CI(row["value"], row["ci_low"], row["ci_high"], "wilson", int(row["n"]))  # noqa: E731
     lab = to_ci(t.iloc[0])
-    log.info("labels: label error rate (train, OOF) %s", lab)
+    log.info("labels: label error rate (train без R2, OOF) %s", lab)
     return [
-        summary_row("Качество меток", f"label error rate (|robust z| > {Z_THRESHOLD}, OOF, train)", lab, scale=100,
-                    fmt="{:.2f}", interp="в %; доля меток, далеко расходящихся с out-of-sample прогнозом"),
-        summary_row("Качество меток", "доля ошибок > 10 раз (|r| > ln 10, OOF, train)", to_ci(t.iloc[1]), scale=100,
-                    fmt="{:.2f}", interp="в %; грубые расхождения; дают большую часть квадратичной ошибки"),
+        summary_row("Качество меток", f"label error rate (|robust z| > {Z_THRESHOLD}, OOF, train без R2)", lab,
+                    scale=100, fmt="{:.2f}", interp="в %; доля меток, далеко расходящихся с out-of-sample прогнозом"),
+        summary_row("Качество меток", "доля ошибок > 10 раз (|r| > ln 10, OOF, train без R2)", to_ci(t.iloc[1]),
+                    scale=100, fmt="{:.2f}", interp="в %; грубые расхождения; дают большую часть квадратичной ошибки"),
         summary_row("Качество меток", "доля служебного значения $501", st.proportion_ci(v501), scale=100, fmt="{:.2f}",
                     interp="в %; минимальная/служебная оценка, по признакам не предсказуема"),
-        summary_row("Качество меток", "RMSLE OOF (train), стратиф. bootstrap по PERMIT_TYPE", oof_rmsle, fmt="{:.4f}",
-                    interp="качество out-of-sample прогноза, на котором построена проверка меток"),
+        summary_row("Качество меток", "доля служебных оценок R2 ({$501, $301} ∪ {≤ $10})", st.proportion_ci(service),
+                    scale=100, fmt="{:.2f}", interp="в %; исключены из обучения и оценки модели (решение 2026-11-03)"),
+        summary_row("Качество меток", "RMSLE OOF (train без R2), стратиф. bootstrap по PERMIT_TYPE", oof_rmsle,
+                    fmt="{:.4f}", interp="качество out-of-sample прогноза, на котором построена проверка меток"),
     ]
 
 
@@ -964,16 +1048,18 @@ def section_shift(ctx: Ctx) -> list[dict]:
     R = {False: representation(ctx, False), True: representation(ctx, True)}
 
     # эмбеддинги [CLS] baseline-модели для подвыборок
+    cls_meta = {"model_md5": file_md5(MODEL_PATH)}
     if CLS_PATH.exists() and not ctx.force:
         z = np.load(CLS_PATH)
-        cls = {k: z[k] for k in z.files}
+        cls = {k: z[k] for k in z.files if k != "_meta"}
+        check_cache(CLS_PATH, cls_meta, json.loads(str(z["_meta"])) if "_meta" in z.files else None)
     else:
         _, X, prep = ctx.feats
         model = build_model(X, prep.cat_cardinalities, DEFAULT_HP, **prep.model_kw)
         model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
         model.to(device)
         cls = {k: embed(model, {kk: vv[v] for kk, vv in X.items()}, device) for k, v in samp.items()}
-        np.savez_compressed(CLS_PATH, **cls)
+        np.savez_compressed(CLS_PATH, **cls, _meta=np.array(json.dumps(cls_meta)))
 
     # train vs *: объекты train — обучающие для baseline, поэтому в пространстве [CLS] сдвиг данных смешан
     # с подгонкой модели под train; val vs test — обе части модель не видела (сдвиг между поздними периодами)
@@ -1018,7 +1104,9 @@ def section_shift(ctx: Ctx) -> list[dict]:
     yr = c["issue_date"].dt.year
     pred = ctx.preds["pred_log"].to_numpy().copy()
     if OOF_PATH.exists():
-        pred[split == "train"] = pd.read_parquet(OOF_PATH)["oof_log"].to_numpy()
+        oof = compute_oof(ctx)
+        assert np.array_equal(oof["row_id"].to_numpy(), c.loc[split == "train", "row_id"].to_numpy())
+        pred[split == "train"] = oof["oof_log"].to_numpy()
     dyn = pd.DataFrame({"год": yr, "v": c["valuation"], "y": y, "r2": (y - pred) ** 2,
                         "s501": c["valuation"] == 501, "alter": c["PERMIT_TYPE"] == "Bldg-Alter/Repair",
                         "comm": c["PERMIT_SUB_TYPE"] == "Commercial", "supp": c["work_desc"].str.contains("supplement", case=False),
@@ -1031,9 +1119,11 @@ def section_shift(ctx: Ctx) -> list[dict]:
     save_table(dt, "shift_by_year")
 
     # ошибка по годам отдельно для частей: train — OOF (случайные фолды внутри периода, интерполяция),
-    # val/test — baseline (прогноз вперёд по времени); 2022 г. содержит train и val
+    # val/test — baseline (прогноз вперёд по времени); 2022 г. содержит train и val; строки без R2
     err = []
+    task = ctx.task
     for (year, part), ix in pd.DataFrame({"год": yr, "часть": split}).groupby(["год", "часть"]).indices.items():
+        ix = ix[task[ix]]
         ci = st.bootstrap_ci(st.rmsle, y[ix], pred[ix], vectorized=True)
         err.append({"год": year, "часть": part, "прогноз": "OOF 5-fold" if part == "train" else "baseline",
                     "n": len(ix), **ci_cols(ci)})
@@ -1174,7 +1264,8 @@ def section_drift_facts(ctx: Ctx) -> None:
         w = X["words"]
         nz = w != 0
         dfw = pd.DataFrame({"год": c["issue_date"].dt.year.to_numpy(), "unk": (w == 1).sum(1), "tok": nz.sum(1),
-                            "trunc": nz.sum(1) == prep.word_len})
+                            # обрезан — слов в тексте больше word_len (по массиву токенов «ровно word_len» не отличить)
+                            "trunc": (word_tokenize(c[TEXT_COL]).str.len() > prep.word_len).to_numpy()})
         g = dfw.groupby("год")
         save_table(pd.DataFrame({"доля UNK среди слов": g["unk"].sum() / g["tok"].sum(),
                                  "средняя длина, слов": g["tok"].mean(),
@@ -1210,7 +1301,7 @@ def section_anomalies(ctx: Ctx) -> list[dict]:
     save_table(tab, "anomalies")
 
     # влияют ли аномалии на ошибку baseline (test)
-    te = split == "test"
+    te = (split == "test") & ctx.task  # без R2
     p = ctx.preds["pred_log"].to_numpy()
     eff = []
     for name, mm in (("аномалии IsolationForest", anom), ("остальные", ~anom)):

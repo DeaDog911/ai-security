@@ -1,0 +1,15 @@
+﻿группа,столбец
+id,PERMIT_NBR
+id,PIN_NBR
+id,APN
+id,USE_CODE
+id,PERMIT_GROUP
+id,REFRESH_TIME
+id,GEOLOCATION
+address,PRIMARY_ADDRESS
+future,STATUS_DESC
+future,STATUS_DATE
+future,COFO_DATE
+target,VALUATION
+missing>99%,junior_adu
+constant,Solar

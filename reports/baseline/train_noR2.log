@@ -1,0 +1,18 @@
+09:10:04 устройство: cuda:AMD Radeon RX 7700 XT
+09:10:09 размеры: {'train': 496596, 'val': 106421, 'test': 106292}; без служебных оценок: {'train': 459612, 'val': 96451, 'test': 96952}
+09:10:09 FT-Transformer: 4321153 параметров, 126 токенов
+C:\Users\deado\IdeaProjects\ai-security\src\model.py:106: UserWarning: Mem Efficient attention on Current AMD GPU is still experimental. Enable it with TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1. (Triggered internally at C:\b\pytorch\aten\src\ATen\native\transformers\hip\sdp_utils.cpp:361.)
+  y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask,
+09:13:23 эпоха   1 | train RMSLE 0.9491 | val RMSLE 0.8303 * | lr 3.0e-04 | 191.9 с
+09:16:32 эпоха   2 | train RMSLE 0.7739 | val RMSLE 0.8109 * | lr 3.0e-04 | 188.8 с
+09:19:40 эпоха   3 | train RMSLE 0.7306 | val RMSLE 0.8038 * | lr 3.0e-04 | 188.8 с
+09:22:49 эпоха   4 | train RMSLE 0.6972 | val RMSLE 0.8242 | lr 3.0e-04 | 188.9 с
+09:25:58 эпоха   5 | train RMSLE 0.6661 | val RMSLE 0.8223 | lr 3.0e-04 | 188.8 с
+09:29:07 эпоха   6 | train RMSLE 0.6374 | val RMSLE 0.8292 | lr 3.0e-04 | 188.8 с
+09:32:16 эпоха   7 | train RMSLE 0.5904 | val RMSLE 0.8431 | lr 1.5e-04 | 188.8 с
+09:35:25 эпоха   8 | train RMSLE 0.5688 | val RMSLE 0.8405 | lr 1.5e-04 | 188.8 с
+09:38:33 эпоха   9 | train RMSLE 0.5531 | val RMSLE 0.8603 | lr 1.5e-04 | 188.5 с
+09:38:33 ранняя остановка: 6 эпох без улучшения
+09:46:23 bootstrap CI (B=2000)...
+09:56:36 TEST: RMSLE 0.8885; 95% CI = [0.8834; 0.8949] (BCa) | MdAPE 53.51; 95% CI = [53.15; 53.97] (BCa) % | ±25%: 0.2545; 95% CI = [0.2517; 0.2572] (wilson)
+09:56:36 наивный прогноз (медиана train): RMSLE 1.7184

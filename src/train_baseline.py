@@ -29,8 +29,9 @@ import pandas as pd
 import torch
 
 import stats as st
-from config import ARTIFACTS_DIR, BOOTSTRAP_B, DATASET_PATHS, DATASETS, REPORTS_DIR, SEED
-from data import SPLIT_INFO_PATH, TARGET, load_dataset
+from config import (ARTIFACTS_DIR, BASELINE_CLIP_MODE, BASELINE_TIME_MODE, BOOTSTRAP_B, DATASET_PATHS, DATASETS,
+                    EXCLUDE_SERVICE, REPORTS_DIR, SEED)
+from data import SPLIT_INFO_PATH, TARGET, load_dataset, service_mask
 from features import WORD_LEN, Preprocessor
 from model import DEFAULT_HP
 from training import TRAIN_HP, build_model, device_name, fit, get_device, predict, set_seed
@@ -85,11 +86,24 @@ def load_features(force: bool = False, log: logging.Logger | None = None):
                 prep.save(prep_path)
                 np.savez_compressed(FEATURES_PATH, row_id=meta["row_id"].to_numpy(), **X)
                 log.info("слова-токены (L = %d) добавлены к признакам за %.0f с", WORD_LEN, time.perf_counter() - t0)
+            if (prep.time_mode, prep.clip_mode) != (BASELINE_TIME_MODE, BASELINE_CLIP_MODE):
+                # режимы чисел baseline сменились (эксперимент time_clip): категории, текст и слова не меняются,
+                # пересчитываются только числовые признаки (fit по train)
+                t0 = time.perf_counter()
+                tr = meta["split"].to_numpy() == "train"
+                old = (prep.time_mode, prep.clip_mode)
+                prep.time_mode, prep.clip_mode = BASELINE_TIME_MODE, BASELINE_CLIP_MODE
+                prep.fit_num(df[tr])
+                X["num"], X["num_mask"] = prep.transform_num(df)
+                prep.save(prep_path)
+                np.savez_compressed(FEATURES_PATH, row_id=meta["row_id"].to_numpy(), **X)
+                log.info("числовые признаки пересчитаны: %s → %s (%d признаков) за %.0f с", old,
+                         (prep.time_mode, prep.clip_mode), len(prep.num_names), time.perf_counter() - t0)
             return meta, X, prep
         log.info("features.npz не соответствует split — пересчитываю")
     t0 = time.perf_counter()
     tr = meta["split"].to_numpy() == "train"
-    prep = Preprocessor().fit(df[tr], meta["y_log"].to_numpy()[tr])
+    prep = Preprocessor(time_mode=BASELINE_TIME_MODE, clip_mode=BASELINE_CLIP_MODE).fit(df[tr], meta["y_log"].to_numpy()[tr])
     X = prep.transform(df)
     prep.save(prep_path)
     np.savez_compressed(FEATURES_PATH, row_id=meta["row_id"].to_numpy(), **X)
@@ -179,7 +193,12 @@ def main() -> None:
         rng = np.random.default_rng(SEED)
         idx = {p: np.sort(rng.choice(v, min(args.smoke_rows if p == "train" else args.smoke_rows // 5, len(v)),
                                      replace=False)) for p, v in idx.items()}
-    log.info("размеры: %s", {p: len(v) for p, v in idx.items()})
+    # R2 (с 2026-11-03): служебные оценки не участвуют в обучении, ранней остановке и оценке;
+    # прогноз сохраняется для всех строк (столбец service)
+    service = service_mask(np.expm1(y_log)) if EXCLUDE_SERVICE else np.zeros(len(meta), dtype=bool)
+    fit_idx = {p: v[~service[v]] for p, v in idx.items()}
+    log.info("размеры: %s; без служебных оценок: %s", {p: len(v) for p, v in idx.items()},
+             {p: len(v) for p, v in fit_idx.items()})
 
     hp = dict(DEFAULT_HP)
     thp = dict(TRAIN_HP)
@@ -188,15 +207,15 @@ def main() -> None:
     elif args.epochs:
         thp["max_epochs"] = args.epochs
 
-    sub = lambda p: {k: v[idx[p]] for k, v in X.items()}  # noqa: E731
-    y_tr_std = (y_log[idx["train"]] - prep.y_mean) / prep.y_std
+    sub = lambda ix: {k: v[ix] for k, v in X.items()}  # noqa: E731
+    y_tr_std = (y_log[fit_idx["train"]] - prep.y_mean) / prep.y_std
     model = build_model(X, prep.cat_cardinalities, hp, **prep.model_kw)
     n_params = sum(p.numel() for p in model.parameters())
     log.info("FT-Transformer: %d параметров, %d токенов", n_params, model.tokenizer.n_tokens)
 
     t0 = time.perf_counter()
-    model, history, best_epoch = fit(model, sub("train"), y_tr_std, sub("val"), y_log[idx["val"]],
-                                     prep.y_mean, prep.y_std, device, thp, log)
+    model, history, best_epoch = fit(model, sub(fit_idx["train"]), y_tr_std, sub(fit_idx["val"]),
+                                     y_log[fit_idx["val"]], prep.y_mean, prep.y_std, device, thp, log)
     train_sec = time.perf_counter() - t0
     out_dir.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), model_path)
@@ -207,26 +226,31 @@ def main() -> None:
     # прогнозы для всех частей (train — in-sample, нужен в ПР4)
     preds = []
     for p, ix in idx.items():
-        pl = predict(model, sub(p), device) * prep.y_std + prep.y_mean
-        preds.append(pd.DataFrame({"row_id": meta["row_id"].to_numpy()[ix], "split": p,
+        pl = predict(model, sub(ix), device) * prep.y_std + prep.y_mean
+        preds.append(pd.DataFrame({"row_id": meta["row_id"].to_numpy()[ix], "split": p, "service": service[ix],
                                    "y_log": y_log[ix], "pred_log": pl.astype(np.float64)}))
     preds = pd.concat(preds, ignore_index=True)
     preds.to_parquet(out_dir / PRED_PATH.name, index=False)
 
     log.info("bootstrap CI (B=%d)...", BOOTSTRAP_B)
     metrics = {}
+    main_rows = ~preds["service"]  # оценка — без служебных оценок (при EXCLUDE_SERVICE)
     for p in ("val", "test"):
-        d = preds[preds["split"] == p]
+        d = preds[(preds["split"] == p) & main_rows]
         # основная оценка (test) — BCa даже при n ≈ 100 тыс. (jackknife считается один раз);
         # для val достаточно percentile
         metrics[p] = evaluate(d["y_log"].to_numpy(), d["pred_log"].to_numpy(),
                               bca_max_n=250_000 if p == "test" else st.BCA_MAX_N)
+    if EXCLUDE_SERVICE:  # для сравнения: test со служебными оценками (вне постановки задачи)
+        d = preds[preds["split"] == "test"]
+        metrics["test_with_service"] = evaluate(d["y_log"].to_numpy(), d["pred_log"].to_numpy())
     # наивный ориентир: медиана log-цели train
-    d = preds[preds["split"] == "test"]
-    naive = np.full(len(d), np.median(y_log[idx["train"]]))
+    d = preds[(preds["split"] == "test") & main_rows]
+    naive = np.full(len(d), np.median(y_log[fit_idx["train"]]))
     metrics["test_naive_median"] = {"rmsle": float(st.rmsle(d["y_log"], naive)),
                                     "mdape_pct": float(st.mdape(d["y_log"].to_numpy(), naive))}
-    metrics["train_in_sample_rmsle"] = float(st.rmsle(*preds.loc[preds.split == "train", ["y_log", "pred_log"]].T.to_numpy()))
+    metrics["train_in_sample_rmsle"] = float(st.rmsle(
+        *preds.loc[(preds.split == "train") & main_rows, ["y_log", "pred_log"]].T.to_numpy()))
     metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=1), encoding="utf-8")
 
     config = {
@@ -237,6 +261,10 @@ def main() -> None:
                         "md5": file_md5(p), "export": "30.10.2026 (данные обновлены 25.10.2026)"}
                     for k, p in DATASET_PATHS.items()},
         "split": json.loads(SPLIT_INFO_PATH.read_text(encoding="utf-8")),
+        "target_filter": {"exclude_service": EXCLUDE_SERVICE,
+                          "rule": "VALUATION ∈ {$501, $301} ∪ {≤ $10} (data.service_mask) — не участвует в обучении "
+                                  "и оценке; split не меняется" if EXCLUDE_SERVICE else None,
+                          "n_fit": {p: int(len(v)) for p, v in fit_idx.items()}},
         "features": prep.summary(),
         "model": {"arch": "FT-Transformer (pre-LN, ReGLU, [CLS]-голова; текст — SVD-токен + слова-токены, "
                           "PAD маскируется в attention)",

@@ -1,0 +1,14 @@
+﻿Параметр,Значение
+Источник,"Building and Safety - Building Permits Issued Between 2010 and 2019 (N) (dyxf-7hc4), https://data.lacity.org/City-Infrastructure-Service-Requests/Building-and-Safety-Building-Permits-Issued-Betwee/dyxf-7hc4/about_data; Building and Safety - Building Permits Issued from 2020 to Present (N) (pi9x-tg5x), https://data.lacity.org/City-Infrastructure-Service-Requests/Building-and-Safety-Building-Permits-Issued-from-2/pi9x-tg5x/about_data"
+Версия,"выгрузка 30.10.2026, данные обновлены 25.10.2026; файлы LA_BLDG_PERMITS_2010_2019_20261030.csv, LA_BLDG_PERMITS_2020_PRESENT_20261030.csv"
+Тип задачи,"регрессия log1p(VALUATION); метрика RMSLE (меньше — лучше), доп. MdAPE, доля в ±25%"
+Модальности,таблица (числовые и категориальные признаки) + короткий текст WORK_DESC
+Строк в наборах,"953,873 (dyxf-7hc4: 533,366, pi9x-tg5x: 420,507)"
+Три типа Bldg (рабочая совокупность),"760,227"
+Исключено: VALUATION пусто / ≤ 0,"40 / 50,513"
+Исключено: дубли без учёта ID,365
+Строк для обучения,"709,309"
+Признаки модели,"12 числовых, 16 категориальных, текст → SVD(64) + 96 слов-токенов; всего токенов 126"
+Исходных столбцов,38
+Split,"хронологический 70/15/15 по ISSUE_DATE: train 496,596 (2010-01-02 … 2022-07-15), val 106,421 (2022-07-16 … 2024-09-04), test 106,292 (2024-09-05 … 2026-10-24)"
+seed,42

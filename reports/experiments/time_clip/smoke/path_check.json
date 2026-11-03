@@ -1,0 +1,18 @@
+{
+ "full": {
+  "42": {
+   "reference": "artifacts\\experiments\\label_cleaning\\smoke\\C96_full_s42",
+   "same_rows": true,
+   "max_abs_diff": 0.0,
+   "bitwise": true
+  }
+ },
+ "noR2": {
+  "42": {
+   "reference": "artifacts\\experiments\\label_cleaning\\smoke\\C96_noR2_s42",
+   "same_rows": true,
+   "max_abs_diff": 0.0,
+   "bitwise": true
+  }
+ }
+}

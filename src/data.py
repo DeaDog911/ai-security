@@ -45,6 +45,14 @@ DATE_COLS = {
 }
 DATE_FORMAT = "%m/%d/%Y"
 TARGET = "valuation"
+SERVICE_VALUES = (501.0, 301.0)  # служебные оценки (ПР1: $501 — 7,7% меток)
+SERVICE_MAX = 10.0               # оценки ≤ $10 ($1 и т. п.) — тоже служебные
+
+
+def service_mask(valuation: np.ndarray) -> np.ndarray:
+    """R2: служебные значения VALUATION {$501, $301} ∪ {≤ $10} (эксперимент label_cleaning, принят 2026-11-03)."""
+    v = np.asarray(valuation, dtype=float)
+    return np.isin(np.round(v, 6), SERVICE_VALUES) | (v <= SERVICE_MAX + 1e-9)
 
 
 def load_raw_csv() -> pd.DataFrame:

@@ -1,0 +1,10 @@
+{
+ "prep_time_mode": "year_clip",
+ "prep_clip_mode": "quantile",
+ "num_bitwise": true,
+ "num_mask_bitwise": true,
+ "refit_same": true,
+ "strict_load": true,
+ "pred_max_abs_diff": 0.0,
+ "ok": true
+}
