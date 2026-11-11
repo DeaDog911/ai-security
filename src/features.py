@@ -291,8 +291,8 @@ class Preprocessor:
         return self.word_vocab.transform(word_tokenize(df[TEXT_COL]), self.word_len)
 
     # ---------------------------------------------------------------- transform
-    def transform(self, df: pd.DataFrame, chunk: int = 100_000) -> dict[str, np.ndarray]:
-        num, num_mask = self.transform_num(df)
+    def transform_cat(self, df: pd.DataFrame) -> np.ndarray:
+        """(N, n_cat) int64: коды категорий (0 = MISSING, 1 = OTHER)."""
         cat = categorical_frame(df)
         codes = []
         for c in self.cat_names:
@@ -300,6 +300,10 @@ class Preprocessor:
             code = v.map(self.cat_vocab[c]).fillna(1).astype(np.int64).to_numpy()
             code[v.isna().to_numpy()] = 0
             codes.append(code)
+        return np.stack(codes, 1)
+
+    def transform_txt(self, df: pd.DataFrame, chunk: int = 100_000) -> np.ndarray:
+        """(N, TXT_DIM) float32: WORK_DESC → TF-IDF → SVD, стандартизовано по train."""
         texts = normalize_text(df[TEXT_COL])
         z = []
         for i in range(0, len(texts), chunk):  # по частям, чтобы не держать всю TF-IDF-матрицу
@@ -307,11 +311,15 @@ class Preprocessor:
             m = sp.hstack([self.tfidf_word.transform(t), self.tfidf_char.transform(t)]).tocsr()
             z.append(self.svd.transform(m))
         z = (np.concatenate(z) - self.txt_mean) / self.txt_std
+        return z.astype(np.float32)
+
+    def transform(self, df: pd.DataFrame, chunk: int = 100_000) -> dict[str, np.ndarray]:
+        num, num_mask = self.transform_num(df)
         out = {
             "num": num,
             "num_mask": num_mask,
-            "cat": np.stack(codes, 1),
-            "txt": z.astype(np.float32),
+            "cat": self.transform_cat(df),
+            "txt": self.transform_txt(df, chunk),
         }
         if self.word_vocab is not None:
             out["words"] = self.transform_words(df)
