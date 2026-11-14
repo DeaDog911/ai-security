@@ -222,13 +222,16 @@ def s03_noise(prs, d: Data) -> None:
     for t in TYPES:
         mod, what, smean, link = TYPE_ROWS[t]
         g = d.grid_row(t, d.s_max)
-        fact = f"{num(g['frac_changed'] * 100, 1)}%"
+        # общий знаменатель — все ячейки портящихся столбцов (T1, T2) или все слова (X1, X2); ревью 2026-11-14 (4)
+        fact = f"{num(g['frac_changed_all'] * 100, 1)}%"
         if t == "T1":
-            fact += "\nуже пустые не меняются"
+            fact += " ячеек\nуже пустые не меняются"
         elif t == "T2":
-            fact += "\nзамена может совпасть с исходным"
+            fact += f" ячеек\n{num(g['frac_changed'] * 100, 1)}% непустых"
         elif t == "X1":
-            fact += f"\n{num(g['frac_changed_of_words'] * 100, 1)}% всех слов"
+            fact += f" слов\n{num(g['frac_changed'] * 100, 1)}% слов ≥ 3 букв"
+        else:
+            fact += " слов"
         rows.append([f"{t}\n{d.names[t]}", mod, what, smean, link, fact])
     mtable(s, 0.45, 1.2, 12.4, rows, [1.55, 0.85, 3.6, 1.75, 2.65, 2.0], size=11, row_h=0.84, sub_size=9.5,
            bold_first_col=True, head_h=0.42)

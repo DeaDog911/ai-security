@@ -7,8 +7,9 @@ test до препроцессора, дальше — обычный transform 
     venv\\Scripts\\python src\\pr2_noise.py              # прогоны (идемпотентно, кеш artifacts/pr2/) + отчёт
     venv\\Scripts\\python src\\pr2_noise.py --smoke      # 5 000 строк test, s ∈ {0,2; 0,4}, r = 2, B = 200
     venv\\Scripts\\python src\\pr2_noise.py --report     # только отчёт по готовому кешу
-    venv\\Scripts\\python src\\pr2_noise.py --only T1,X2 # часть типов шума
+    venv\\Scripts\\python src\\pr2_noise.py --only T1,X2 # часть типов шума; отчёт → reports/pr2/only_T1_X2/
     venv\\Scripts\\python src\\pr2_noise.py --force      # удалить кеш прогонов и посчитать заново
+                                                       # (с --only — только прогоны выбранных типов)
 
 Типы искажений (s — доля затронутых значений, сетка s ∈ {0; 0,1; …; 0,5}, r = 5 реализаций):
     T1  таблица  пропуски (MCAR): значение → пусто (числа: площадь, высота, DU, ADU, координаты — пара lat/lon
@@ -588,6 +589,10 @@ class Report:
                     inf = self.info(f"{nt}_s{s:.2f}_j{j}")
                     e = max(inf["eligible"], 1)
                     p = self.load(inf["key"])
+                    # доля от всех значений (ревью 2026-11-14 (4)): у T2 eligible — только непустые категории,
+                    # у T1 — все ячейки, у X1 — слова ≥ 3 букв; общий знаменатель для сравнения типов — все ячейки
+                    # портящихся столбцов (T1, T2) или все слова (X1, X2)
+                    all_vals = (len(inf["units"]) * len(self.y) if TYPES[nt]["kind"] == "tab" else inf["words"])
                     rows.append({"type": nt, "name": TYPES[nt]["name"], "modality": TYPES[nt]["modality"],
                                  "level": s, "j": j, "seed": inf["seed"], "eligible_unit": ELIGIBLE[nt],
                                  # T1/T2: число портящихся единиц на строку (у T1 пара lat/lon — одна единица)
@@ -595,10 +600,12 @@ class Report:
                                  "eligible": inf["eligible"], "selected": inf["selected"], "changed": inf["changed"],
                                  "frac_selected": inf["selected"] / e, "frac_changed": inf["changed"] / e,
                                  "frac_changed_of_words": inf["changed"] / inf["words"] if "words" in inf else np.nan,
-                                 "rmsle": float(st.rmsle(self.y, p)), "sec": inf["sec"]})
-        runs = self.save(pd.DataFrame(rows), "noise_runs")
+                                 "rmsle": float(st.rmsle(self.y, p)), "sec": inf["sec"],
+                                 "frac_changed_all": inf["changed"] / max(all_vals, 1)})
+        runs = pd.DataFrame(rows)
         # доля выбранных значений, которые шум не изменил: у T1 — уже пустые ячейки, у T2 — совпавшая категория
         runs["frac_selected_unchanged"] = 1 - runs["changed"] / runs["selected"].clip(lower=1)
+        runs = runs[[c for c in runs if c != "frac_changed_all"] + ["frac_changed_all"]]  # новые столбцы — в конце
         self.save(runs, "noise_runs")
         g = runs.groupby(["type", "name", "modality", "level", "eligible_unit"], sort=False).agg(
             r=("j", "size"), n_units=("n_units", "first"), eligible=("eligible", "mean"),
@@ -606,7 +613,7 @@ class Report:
             frac_selected_unchanged=("frac_selected_unchanged", "mean"),
             frac_changed=("frac_changed", "mean"), frac_changed_of_words=("frac_changed_of_words", "mean"),
             rmsle_real_min=("rmsle", "min"), rmsle_real_max=("rmsle", "max"),
-            rmsle_real_std=("rmsle", "std")).reset_index()
+            rmsle_real_std=("rmsle", "std"), frac_changed_all=("frac_changed_all", "mean")).reset_index()
         g.insert(4, "seeds", [", ".join(str(SEED + 1000 * TYPES[t]["t"] + 100 * int(round(s * 10)) + j)
                                         for j in range(self.r)) for t, s in zip(g["type"], g["level"])])
         self.grid = self.save(g, "noise_grid")
@@ -757,9 +764,11 @@ class Report:
         df = pd.DataFrame(rows)
         # ΔM на одно фактически изменённое значение в строке: у групп разная заполненность (площадь есть у ~27% строк)
         # и разное число столбцов (1–4), поэтому рейтинг по ΔM при одном s, как и сравнение типов, зависит от шкалы.
-        # changed_per_row = доля изменённых ячеек группы × число единиц шума (ревью 2026-11-14 (3): прежде делили
-        # только на долю, и группы из 2–4 столбцов выглядели вреднее в n_units раз)
-        df["changed_per_row"] = df["frac_changed"] * df["n_units"]
+        # changed_per_row = число фактически изменённых значений группы на строку = Σchanged / (r·n) (ревью
+        # 2026-11-14 (4): прежде — frac_changed × n_units, что верно только у T1; у T2 eligible — непустые
+        # категории, и у частично заполненных групп (конструкция, флаги) доля завышалась)
+        df["changed_per_row"] = [sum(x["changed"] for x in infos) / (len(infos) * len(self.y))
+                                 for _, _, infos in keys]
         for a in ("", "_low", "_high"):
             df[f"delta_per_changed{a}"] = df[f"delta{a}"] / df["changed_per_row"]
         # минимальная доля пропусков в train среди признаков модели группы: 0 — эмбеддинг «пропуск» не обучался
@@ -1149,14 +1158,28 @@ def main() -> None:
     levels, r, B = ((0.2, 0.4), 2, 200) if args.smoke else (LEVELS, R_REAL, BOOTSTRAP_B)
     run_dir = ARTIFACTS_DIR / "pr2" / ("smoke" if args.smoke else "runs")
     out_dir = REPORTS_DIR / "pr2" / "smoke" if args.smoke else REPORTS_DIR / "pr2"
+    partial = set(types) != set(TYPES)
+    if partial:  # частичный отчёт не затирает полный (ревью 2026-11-14 (4))
+        out_dir = out_dir / ("only_" + "_".join(types))
     get_logger(ARTIFACTS_DIR / "logs" / ("pr2_noise_smoke.log" if args.smoke else "pr2_noise.log"))
     t0 = time.perf_counter()
     ctx = Ctx(args.smoke, args.smoke_rows, args.device)
     log.info("ПР2: test %d строк (без R2: %d), устройство %s; типы %s, уровни %s, r = %d, B = %d",
              len(ctx.idx), int(ctx.task.sum()), device_name(ctx.device), types, levels, r, B)
     log.info("T1 портит: %s; T2 — категории: %s", [("+".join(u)) for u in ctx.units(ntype="T1")], ctx.cat_cols)
-    check_cache(run_dir, cache_meta(ctx, args.smoke), args.force and not args.report)
+    force = args.force and not args.report
+    # --force с --only удаляет только прогоны выбранных типов, а не весь кеш
+    check_cache(run_dir, cache_meta(ctx, args.smoke), force and not partial)
     runs = plan_runs(ctx, types, levels, r, not args.no_features, not args.no_ablation)
+    if force and partial:
+        n_del = 0
+        for run in runs:
+            for ext in (".npy", ".json"):
+                f = run_dir / f"{run.key}{ext}"
+                if f.exists():
+                    f.unlink()
+                    n_del += 1
+        log.info("--force --only: удалено %d файлов прогонов типов %s (прочий кеш сохранён)", n_del, types)
     if not args.report:
         pred0 = self_checks(ctx, args.smoke)
         if not (run_dir / "clean.npy").exists():
