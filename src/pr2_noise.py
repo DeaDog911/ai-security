@@ -26,6 +26,9 @@ Seed реализации j уровня k типа t: 42 + 1000·t + 100·k + j
 парное сравнение X1 и X2 → x1_vs_x2.csv.
 X2long (пятое ревью 2026-11-14): удаление только слов ≥ 3 букв (тот же набор слов, что у X1; seed с t = 5) —
 парно с X1 и X2 → x2_long.csv.
+Шестое ревью 2026-11-14: в bias/desc_len — квартили прогноза на чистом test (условное смещение модели; квартили
+VALUATION смещены отбором по цели); в by_feature — взаимодействие групп (ΔM всех сразу − сумма по группам, RMSLE и MSE);
+X2 не склеивает числа на стыке удалённого слова (версия шума X2 = 2, NOISE_VERSION).
 
 Статистика: M = RMSLE (меньше — лучше); ΔM(s) = M(0) − M(s) (отрицательное — ухудшение), R_rel = M(s)/M(0)
 (> 1 — ухудшение), R-AUC = 1/(s_max − s_min)·∫R(s)ds по трапециям с s₀ = 0 (меньше — лучше).
@@ -75,6 +78,10 @@ TYPES = {
 }
 ABLATION = {"text": "только текст (desc_len чистый)", "len": "только desc_len (текст чистый)"}  # X2
 X2LONG_T = 5  # t в seed для X2long (удаление только слов ≥ 3 букв)
+# Версия кода шума по типу (шестое ревью 2026-11-14): хранится в json прогона; прогон старой версии считается
+# заново, отчёт по нему не строится. X2 v2 — исправлена склейка чисел на стыке удалённого слова (X2, X2text,
+# X2len, X2long). Прогоны без поля — версия 1.
+NOISE_VERSION = {"clean": 1, "T1": 1, "T2": 1, "X1": 1, "X2": 2}
 ELIGIBLE = {"T1": "все ячейки затрагиваемых признаков", "T2": "непустые категории",
             "X1": "слова из ≥ 3 букв", "X2": "все слова (токены модели)"}
 COLORS = {"T1": "#2a78d6", "T2": "#eb6834", "X1": "#1baf7a", "X2": "#eda100"}  # dataviz: слоты 1–4
@@ -173,8 +180,14 @@ def typo_texts(texts: list[str], p: float, rng: np.random.Generator):
     return out, elig, sel, ch
 
 
+def _glues(tail: str, head: str) -> bool:
+    """Склеятся ли токены на стыке tail|head: «ab|cd», «400|.2» (→ 400.2), «5.|5» (→ 5.5)."""
+    return TOKEN_RE.findall(tail) + TOKEN_RE.findall(head) != TOKEN_RE.findall(tail + head)
+
+
 def delete_words(texts: list[str], p: float, rng: np.random.Generator, long_only: bool = False):
-    """X2. Удаляется токен модели вместе с одним соседним пробелом; соседние токены не склеиваются.
+    """X2. Удаляется токен модели вместе с одним соседним пробелом; соседние токены не склеиваются
+    (шестое ревью 2026-11-14: прежде «400 sqft.2» → «400.2» — два числа сливались в одно).
     long_only — удаляются только слова из ≥ 3 букв (те же, что портит X1), числа и короткие слова не трогаются."""
     n = len(texts)
     elig, sel = np.zeros(n, np.int32), np.zeros(n, np.int32)
@@ -190,7 +203,7 @@ def delete_words(texts: list[str], p: float, rng: np.random.Generator, long_only
         if not hit.any():
             out.append(t)
             continue
-        pieces, pos, L, last = [], 0, len(t), ""
+        pieces, pos, L, tail = [], 0, len(t), ""
         for (a, b), h in zip(spans, hit):
             if not h:
                 continue
@@ -200,10 +213,11 @@ def delete_words(texts: list[str], p: float, rng: np.random.Generator, long_only
                 a -= 1
             if a > pos:
                 pieces.append(t[pos:a])
-                last = t[a - 1]
-            if last.isalnum() and b < L and t[b].isalnum():  # «abc1def» без «1» не склеивается в «abcdef»
+                tail = (tail + t[pos:a])[-2:]
+            # «abc1def» без «1» не склеивается в «abcdef», «400 sqft.2» без «sqft» — в «400.2»
+            if (tail[-1:].isalnum() and t[b:b + 1].isalnum()) or _glues(tail, t[b:b + 2]):
                 pieces.append(" ")
-                last = " "
+                tail = " "
             pos = b
             sel[i] += 1
         pieces.append(t[pos:])
@@ -419,7 +433,7 @@ def check_cache(run_dir, meta: dict, force: bool) -> None:
 def save_run(run_dir, run: Run, pred: np.ndarray, stats: dict, sec: float) -> None:
     info = {"key": run.key, "type": run.ntype, "level": run.level, "j": run.j, "seed": run.seed,
             "group": run.group, "units": ["+".join(u) for u in run.units], "variant": run.variant,
-            "sec": round(sec, 1), **stats}
+            "sec": round(sec, 1), **stats, "noise_version": NOISE_VERSION[run.ntype]}
     np.save(run_dir / f"{run.key}.npy", pred.astype(np.float32))
     (run_dir / f"{run.key}.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
 
@@ -455,8 +469,20 @@ def self_checks(ctx: Ctx, smoke: bool) -> np.ndarray:
     short_same = np.mean([a == [w for w in TOKEN_RE.findall(t)] for a, t in zip(short, texts)])
     if long_left:
         raise AssertionError(f"X2long при p = 1 оставил {long_left} слов из ≥ 3 букв")
+    if short_same != 1:  # шестое ревью 2026-11-14: прежде 0,9974 — склейка чисел на стыке удалённого слова
+        raise AssertionError(f"X2long при p = 1 изменил прочие токены в {1 - short_same:.4%} строк")
     log.info("проверка: X2long при p = 1 удалил %d слов ≥ 3 букв, прочие токены сохранены без изменений "
-             "в %.4f строк", int(sel.sum()), short_same)
+             "во всех строках", int(sel.sum()))
+    # X2 при p = 0,5: оставшиеся токены — подпоследовательность исходных, их ровно на sel меньше (ничего не склеилось)
+    texts, _, sel, _ = delete_words(ctx.texts, 0.5, np.random.default_rng(SEED))
+    bad = 0
+    for t0, t1, k in zip(ctx.texts, texts, sel):
+        src, out = TOKEN_RE.findall(t0), TOKEN_RE.findall(t1)
+        it = iter(src)
+        bad += len(out) != len(src) - k or not all(w in it for w in out)
+    if bad:
+        raise AssertionError(f"X2 при p = 0,5: оставшиеся токены не совпали с исходными без удалённых в {bad} строках")
+    log.info("проверка: X2 при p = 0,5 — оставшиеся токены совпадают с исходными без удалённых во всех строках")
 
     pred = ctx.predict(ctx.X)
     base = pd.read_parquet(PRED_PATH).set_index("row_id").loc[ctx.df["row_id"], "pred_log"].to_numpy()
@@ -471,9 +497,19 @@ def self_checks(ctx: Ctx, smoke: bool) -> np.ndarray:
     return pred
 
 
+def is_current(run_dir, key: str, ntype: str) -> bool:
+    """Прогон есть в кеше и посчитан текущей версией кода шума."""
+    npy, js = run_dir / f"{key}.npy", run_dir / f"{key}.json"
+    if not (npy.exists() and js.exists()):
+        return False
+    return json.loads(js.read_text(encoding="utf-8")).get("noise_version", 1) == NOISE_VERSION[ntype]
+
+
 def run_all(ctx: Ctx, runs: list[Run], run_dir) -> None:
-    todo = [r for r in runs if not (run_dir / f"{r.key}.npy").exists()]
-    log.info("прогонов: %d, в кеше: %d, считать: %d", len(runs), len(runs) - len(todo), len(todo))
+    todo = [r for r in runs if not is_current(run_dir, r.key, r.ntype)]
+    stale = sum((run_dir / f"{r.key}.npy").exists() for r in todo)
+    log.info("прогонов: %d, в кеше: %d, считать: %d (из них старой версии шума: %d)", len(runs),
+             len(runs) - len(todo), len(todo), stale)
     t_all = time.perf_counter()
     for i, run in enumerate(todo, start=1):
         t0 = time.perf_counter()
@@ -550,6 +586,10 @@ class Report:
         path = self.run_dir / f"{key}.npy"
         if not path.exists():
             raise FileNotFoundError(f"нет прогона {key} в {self.run_dir}: запустите без --report")
+        inf = self.info(key)
+        if inf.get("noise_version", 1) != NOISE_VERSION[inf["type"]]:
+            raise RuntimeError(f"прогон {key} посчитан старой версией шума {inf['type']} "
+                               f"(v{inf.get('noise_version', 1)} ≠ v{NOISE_VERSION[inf['type']]}): запустите без --report")
         return np.load(path)[self.task].astype(np.float64)
 
     def info(self, key: str) -> dict:
@@ -804,6 +844,32 @@ class Report:
         df["rank"] = df[df["group"] != "Все признаки типа"].groupby("type")["delta"].rank(method="min")
         df["rank_per_changed"] = (df[df["group"] != "Все признаки типа"].groupby("type")["delta_per_changed"]
                                   .rank(method="min"))
+        # Взаимодействие (шестое ревью 2026-11-14), только в строке «Все признаки типа»: ΔM всех групп сразу минус
+        # сумма ΔM отдельных групп (< 0 — вместе вреднее суммы). ΔRMSLE не аддитивна (корень вогнутый: при
+        # аддитивной MSE сумма ΔRMSLE по модулю больше ΔRMSLE всех сразу), поэтому то же — в единицах MSE.
+        mse = rm ** 2
+        m0sq = M ** 2
+        for c in ("sum_groups_delta", "interaction", "interaction_low", "interaction_high",
+                  "interaction_mse", "interaction_mse_low", "interaction_mse_high"):
+            df[c] = np.nan
+        for nt in tab:
+            gi = [i for i, (t, g, _) in enumerate(keys, start=1) if t == nt and g != "Все признаки типа"]
+            ai = [i for i, (t, g, _) in enumerate(keys, start=1) if t == nt and g == "Все признаки типа"]
+            if not gi or not ai:
+                continue
+            a = ai[0]
+            d_b = rm[:, [0]] - rm  # (B, K): ΔRMSLE
+            dm_b = mse[:, [0]] - mse  # (B, K): ΔMSE
+            inter_b = d_b[:, a] - d_b[:, gi].sum(1)
+            inter_mse_b = dm_b[:, a] - dm_b[:, gi].sum(1)
+            dM = M[0] - M
+            dMS = m0sq[0] - m0sq
+            row = (df["type"] == nt) & (df["group"] == "Все признаки типа")
+            df.loc[row, "sum_groups_delta"] = dM[gi].sum()
+            df.loc[row, "interaction"] = dM[a] - dM[gi].sum()
+            df.loc[row, ["interaction_low", "interaction_high"]] = list(pci(inter_b))
+            df.loc[row, "interaction_mse"] = dMS[a] - dMS[gi].sum()
+            df.loc[row, ["interaction_mse_low", "interaction_mse_high"]] = list(pci(inter_mse_b))
         self.feat = self.save(df.sort_values(["type", "delta"]).reset_index(drop=True), "by_feature")
         return self.feat
 
@@ -925,7 +991,8 @@ class Report:
 
     # ------------------------------------------------------------ сдвиг прогноза
     def bias_groups(self):
-        """Группы для разбора сдвига: все, квартили VALUATION (test без R2), обрезанные описания."""
+        """Группы для разбора сдвига: все, квартили VALUATION (test без R2), обрезанные описания, шаблон, квартили
+        прогноза на чистом test."""
         y = self.y
         q = np.quantile(y, [0.25, 0.5, 0.75])
         yq = np.digitize(y, q, right=True)
@@ -939,12 +1006,23 @@ class Report:
         groups += [("Обрезка текста", f"обрезан (> {wl} слов)", ntok > wl, ["X1", "X2"])]
         tpl = self.ctx.template[self.task]
         groups += [("Шаблон описания", TEMPLATE_LABEL, tpl, None), ("Шаблон описания", "прочие описания", ~tpl, None)]
+        # Квартили прогноза на чистом test (шестое ревью 2026-11-14). Группы по факту y показывают «плюс внизу,
+        # минус вверху» у любой неидеальной модели (в нижний квартиль y чаще попадают объекты с фактом ниже прогноза):
+        # это эффект отбора по цели, а не смещение модели. Условное смещение модели — по квартилям прогноза.
+        p0 = self.P0[:, 0]
+        qp = np.quantile(p0, [0.25, 0.5, 0.75])
+        pb = np.digitize(p0, qp, right=True)
+        mp = np.round(np.expm1(qp)).astype(int)
+        plab = [f"P1: прогноз ≤ ${mp[0]}", f"P2: ${mp[0]}–{mp[1]}", f"P3: ${mp[1]}–{mp[2]}", f"P4: > ${mp[2]}"]
+        groups += [("Квартиль прогноза (чистый test)", plab[k], pb == k, None) for k in range(4)]
         return groups, qlab
 
     def bias(self) -> pd.DataFrame:
-        """Средний остаток (прогноз − факт, log1p; > 0 — завышение) по уровням шума: в целом, по квартилям цели
-        и для обрезанных описаний. Объясняет расхождение RMSLE и MdAPE: шум, сдвигающий прогноз вниз, частично
-        компенсирует завышение baseline на мелких разрешениях."""
+        """Средний остаток (прогноз − факт, log1p; > 0 — завышение) по уровням шума: в целом, по квартилям цели,
+        по квартилям прогноза на чистом test, по шаблону и для обрезанных описаний. Объясняет расхождение RMSLE
+        и MdAPE: шум, сдвигающий прогноз вниз, частично компенсирует общее завышение baseline. Уровень остатка
+        в квартилях цели у baseline — эффект отбора по цели; смещение модели читается по квартилям прогноза, а
+        по квартилям цели — только изменение остатка под шумом."""
         y = self.y
         res = np.stack([(p - y[:, None]).mean(1) for p in self.P], 1)  # (n, K): средний остаток по реализациям
         groups, qlab = self.bias_groups()
@@ -1092,33 +1170,28 @@ class Report:
         tpl = self.ctx.template[self.task]
         cols = [0] + [self.col_idx[(nt, s)] for nt in ("X1", "X2") for s in self.levels]
         k = len(self.levels)
-        # доля слов, доступных опечатке (≥ 3 букв), среди всех токенов группы — для сравнения по изменённым словам
+        # доля слов, доступных опечатке (≥ 3 букв), среди всех токенов группы
         texts = [t for t, keep in zip(self.ctx.texts, self.task) if keep]
         n_elig = np.array([sum(1 for m in LETTER_RE.finditer(t) if m.end() - m.start() >= MIN_TYPO_LEN)
                            for t in texts])
         ntok = self.ctx.n_tokens[self.task]
-        unchanged = self.grid[self.grid["type"] == "X1"].set_index("level")["frac_selected_unchanged"]
         rows = []
         for gname, m in (("все", np.ones(len(self.y), bool)), (TEMPLATE_LABEL, tpl), ("прочие описания", ~tpl)):
             E = self.E[m][:, cols]
             rm = boot(E, self.B, SEED)["rmsle"]
             M = np.sqrt(E.mean(0))
             share = n_elig[m].sum() / ntok[m].sum()
-            d2 = np.r_[0.0, M[0] - M[1 + k:]]  # ΔM X2 по уровням, s₀ = 0 (у X2 доля изменённых слов = s)
             for i, s in enumerate(self.levels):
                 a, b = 1 + i, 1 + k + i
                 lo, hi = pci(rm[:, a] - rm[:, b])
-                # оценка: доля изменённых слов у X1 ≈ s · (1 − доля неизменивших) · доля слов ≥ 3 букв в группе;
-                # ΔM X2 при той же доле удалённых слов — линейная интерполяция кривой X2 группы
-                fw = s * (1 - unchanged.loc[s]) * share
+                # прежние столбцы x1_frac_changed_of_words и delta_x2_at_x1_words (интерполяция кривой X2) удалены
+                # в шестом ревью 2026-11-14: пятое ревью показало, что они смешивали состав слов; на одних и тех же
+                # словах сравнение — x2_long.csv
                 rows.append({"group": gname, "n": int(m.sum()), "level": s, "rmsle0": M[0],
                              "rmsle_x1": M[a], "rmsle_x2": M[b], "delta_x1": M[0] - M[a], "delta_x2": M[0] - M[b],
                              "diff": M[a] - M[b], "diff_low": lo, "diff_high": hi,
-                             "significant": bool(hi < 0 or lo > 0),
-                             "x1_eligible_share": share, "x1_frac_changed_of_words": fw,
-                             "delta_x2_at_x1_words": float(np.interp(fw, [0.0] + self.levels, d2)),
-                             "B": self.B, "ci_method": "percentile (парный, внутри группы); "
-                                                       "delta_x2_at_x1_words — интерполяция, без CI"})
+                             "significant": bool(hi < 0 or lo > 0), "x1_eligible_share": share,
+                             "B": self.B, "ci_method": "percentile (парный, внутри группы)"})
         self.x12 = self.save(pd.DataFrame(rows), "x1_vs_x2")
         return self.x12
 

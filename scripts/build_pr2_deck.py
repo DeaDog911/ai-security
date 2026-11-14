@@ -420,12 +420,16 @@ def s10_bias(prs, d: Data, tmp: Path) -> None:
     picture(s, REP / "bias_curves.png", 0.35, 1.2, 5.6, 3.6, crop=(0, 0, 0.5, 1), tmp=tmp)
     note(s, 0.45, 4.85, 5.5, 0.5, "Средний остаток log1p(прогноз) − log1p(факт); > 0 — завышение. Коридор — 95% CI.")
     sm = d.s_max
-    qs = [g for g in d.bias[d.bias["grouping"] == "Квартиль VALUATION"]["group"].unique()]
-    rows = [["Стоимость", "baseline"] + [f"{t}, s = {lvl(sm)}" for t in TYPES]]
+    # квартили прогноза на чистом test, а не факта: по факту любая неидеальная модель «завышает дешёвые и занижает
+    # дорогие» — эффект отбора по цели (шестое ревью 2026-11-14)
+    qg = "Квартиль прогноза (чистый test)"
+    qs = [g for g in d.bias[d.bias["grouping"] == qg]["group"].unique()]
+    rows = [["Прогноз baseline", "baseline"] + [f"{t}, s = {lvl(sm)}" for t in TYPES]]
     for q in qs + ["все"]:
-        gg = "Все" if q == "все" else "Квартиль VALUATION"
+        gg = "Все" if q == "все" else qg
         b0 = d.bs("T1", 0.0, gg, q)
-        lab = re.sub(r"\d{4,}", lambda m: num(int(m.group())), q.split(": ")[-1]).replace("≤", "до")
+        lab = re.sub(r"\d{4,}", lambda m: num(int(m.group())), q.split(": ")[-1]).replace("прогноз ", "")
+        lab = lab.replace("≤", "до")
         row = ["Все объекты" if q == "все" else lab,
                f"{sg(b0['bias'], 2)}\n{ci(b0['bias_low'], b0['bias_high'], 2)}"]
         for t in TYPES:
@@ -435,18 +439,19 @@ def s10_bias(prs, d: Data, tmp: Path) -> None:
     mtable(s, 6.2, 1.2, 6.7, rows, [1.55, 1.05, 1.03, 1.03, 1.03, 1.03], size=12, row_h=0.6, head_size=10.5,
            sub_size=9.5, bold_first_col=True)
     tr0 = d.grp("X2", 0.4, "Обрезка текста", "обрезан (> 96 слов)")
+    b_all = d.bs("T1", 0.0, "Все", "все")
     tx = d.abl("text", sm)
     text_box(s, 0.45, 5.35, 12.45, 1.75, [
-        ("Baseline прижимает прогноз к среднему: дешёвые работы завышает, дорогие занижает. Табличный шум это "
-         "усиливает — меньше информации, прогноз ближе к среднему.", {"bullet": True}),
-        ("Удаление слов сдвигает все прогнозы вниз и частично гасит завышение: отсюда «улучшение» MdAPE и RMSLE на "
+        (f"Baseline в среднем завышает ({sg(b_all['bias'], 2)}), но к среднему прогноз не прижимает (по квартилям "
+         "прогноза). Табличный шум прижимает: меньше информации — прогноз ближе к среднему.", {"bullet": True}),
+        ("Удаление слов сдвигает прогнозы вниз (кроме самых дешёвых) и частично гасит завышение: отсюда «улучшение» MdAPE и RMSLE на "
          f"обрезанных описаниях (ΔM {sg(tr0['delta'], 3)} {ci(tr0['delta_low'], tr0['delta_high'], 3)} при s = 0,4) — "
          "компенсация смещения, а не устойчивость. Вывод делаем по RMSLE.", {"bullet": True}),
         (f"Сдвиг идёт через сам текст, а не через длину описания: при неизменной длине остаётся "
          f"{num(100 * tx['share_delta_bias'], 0)}% сдвига (s = {lvl(sm)}).", {"bullet": True}),
     ], size=12, space=4)
     note(s, 6.2, 4.85, 6.7, 0.5, f"Таблица — средний остаток и 95% CI (парный percentile bootstrap внутри группы, "
-                                 f"B = {d.B}); квартили стоимости test.")
+                                 f"B = {d.B}); квартили прогноза на чистом test.")
 
 
 def s11_conclusions(prs, d: Data) -> None:
