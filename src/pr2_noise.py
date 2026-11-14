@@ -24,6 +24,8 @@ Seed реализации j уровня k типа t: 42 + 1000·t + 100·k + j
 (seed X2) прогоняются с чистым desc_len (X2text_*) и с чистым текстом (X2len_*) → desc_len.csv/png.
 Шаблон re-roof (третье ревью 2026-11-14): отдельная подгруппа в by_group и bias, квартили длины — без него;
 парное сравнение X1 и X2 → x1_vs_x2.csv.
+X2long (пятое ревью 2026-11-14): удаление только слов ≥ 3 букв (тот же набор слов, что у X1; seed с t = 5) —
+парно с X1 и X2 → x2_long.csv.
 
 Статистика: M = RMSLE (меньше — лучше); ΔM(s) = M(0) − M(s) (отрицательное — ухудшение), R_rel = M(s)/M(0)
 (> 1 — ухудшение), R-AUC = 1/(s_max − s_min)·∫R(s)ds по трапециям с s₀ = 0 (меньше — лучше).
@@ -72,6 +74,7 @@ TYPES = {
     "X2": {"t": 4, "modality": "текст", "name": "Удаление слов", "kind": "text"},
 }
 ABLATION = {"text": "только текст (desc_len чистый)", "len": "только desc_len (текст чистый)"}  # X2
+X2LONG_T = 5  # t в seed для X2long (удаление только слов ≥ 3 букв)
 ELIGIBLE = {"T1": "все ячейки затрагиваемых признаков", "T2": "непустые категории",
             "X1": "слова из ≥ 3 букв", "X2": "все слова (токены модели)"}
 COLORS = {"T1": "#2a78d6", "T2": "#eb6834", "X1": "#1baf7a", "X2": "#eda100"}  # dataviz: слоты 1–4
@@ -170,13 +173,15 @@ def typo_texts(texts: list[str], p: float, rng: np.random.Generator):
     return out, elig, sel, ch
 
 
-def delete_words(texts: list[str], p: float, rng: np.random.Generator):
-    """X2. Удаляется токен модели вместе с одним соседним пробелом; соседние токены не склеиваются."""
+def delete_words(texts: list[str], p: float, rng: np.random.Generator, long_only: bool = False):
+    """X2. Удаляется токен модели вместе с одним соседним пробелом; соседние токены не склеиваются.
+    long_only — удаляются только слова из ≥ 3 букв (те же, что портит X1), числа и короткие слова не трогаются."""
     n = len(texts)
     elig, sel = np.zeros(n, np.int32), np.zeros(n, np.int32)
     out = []
     for i, t in enumerate(texts):
-        spans = [m.span() for m in TOKEN_RE.finditer(t)]
+        spans = [m.span() for m in TOKEN_RE.finditer(t)
+                 if not long_only or (m.group()[0].isalpha() and m.end() - m.start() >= MIN_TYPO_LEN)]
         elig[i] = len(spans)
         if not spans:
             out.append(t)
@@ -318,8 +323,10 @@ class Ctx:
                 sel_n += int((sel & task).sum())
                 ch_n += int((sel & (draw != self.cat_norm[c]) & task).sum())
             return df, {"eligible": cells, "selected": sel_n, "changed": ch_n}
-        fn = typo_texts if run.ntype == "X1" else delete_words
-        texts, elig, sel, ch = fn(self.texts, p, rng)
+        if run.ntype == "X1":
+            texts, elig, sel, ch = typo_texts(self.texts, p, rng)
+        else:
+            texts, elig, sel, ch = delete_words(self.texts, p, rng, long_only=run.variant == "long")
         df[TEXT_COL] = texts
         return df, {"eligible": int(elig[task].sum()), "selected": int(sel[task].sum()),
                     "changed": int(ch[task].sum()), "words": int(self.n_tokens[task].sum())}
@@ -371,6 +378,12 @@ def plan_runs(ctx: Ctx, types, levels, r, features: bool, ablation: bool = True)
                 for j in range(r):
                     runs.append(Run(f"X2{variant}_s{s:.2f}_j{j}", "X2", s, j, SEED + 1000 * t + 100 * k + j,
                                     variant=variant))
+        # X2long (пятое ревью 2026-11-14): удаление только слов ≥ 3 букв — тот же набор слов, что у X1; свои seed
+        for s in levels:
+            k = int(round(s * 10))
+            for j in range(r):
+                runs.append(Run(f"X2long_s{s:.2f}_j{j}", "X2", s, j, SEED + 1000 * X2LONG_T + 100 * k + j,
+                                variant="long"))
     if features:
         for nt in [x for x in types if TYPES[x]["kind"] == "tab"]:
             t = TYPES[nt]["t"]
@@ -435,6 +448,15 @@ def self_checks(ctx: Ctx, smoke: bool) -> np.ndarray:
         if not (same and diff):
             raise AssertionError(f"{nt}: одинаковый seed → одинаковый шум: {same}; разные seed → разный: {diff}")
     log.info("проверка: одинаковый seed даёт одинаковую реализацию, разные seed — разные")
+    # X2long при p = 1 удаляет все слова ≥ 3 букв и не трогает числа и короткие слова
+    texts, _, sel, _ = delete_words(ctx.texts, 1.0, np.random.default_rng(SEED), long_only=True)
+    long_left = sum(1 for t in texts for w in TOKEN_RE.findall(t) if w[0].isalpha() and len(w) >= MIN_TYPO_LEN)
+    short = [[w for w in TOKEN_RE.findall(t) if not (w[0].isalpha() and len(w) >= MIN_TYPO_LEN)] for t in ctx.texts]
+    short_same = np.mean([a == [w for w in TOKEN_RE.findall(t)] for a, t in zip(short, texts)])
+    if long_left:
+        raise AssertionError(f"X2long при p = 1 оставил {long_left} слов из ≥ 3 букв")
+    log.info("проверка: X2long при p = 1 удалил %d слов ≥ 3 букв, прочие токены сохранены без изменений "
+             "в %.4f строк", int(sel.sum()), short_same)
 
     pred = ctx.predict(ctx.X)
     base = pd.read_parquet(PRED_PATH).set_index("row_id").loc[ctx.df["row_id"], "pred_log"].to_numpy()
@@ -1100,6 +1122,63 @@ class Report:
         self.x12 = self.save(pd.DataFrame(rows), "x1_vs_x2")
         return self.x12
 
+    # ------------------------------------------------------------ X2long: удаление только слов ≥ 3 букв
+    def x2_long(self) -> pd.DataFrame | None:
+        """Пятое ревью 2026-11-14: X2 удаляет и числа, и короткие слова (27% токенов), X1 — только слова ≥ 3 букв.
+        X2long удаляет только слова ≥ 3 букв, поэтому при одном s X1 и X2long затрагивают одну и ту же долю тех же
+        слов. Парно: diff_x1 = M(X1) − M(X2long) (> 0 — опечатка вреднее удаления того же слова);
+        diff_x2 = M(X2) − M(X2long) (> 0 — удаление чисел и коротких слов добавляет вред)."""
+        if not {"X1", "X2"} <= set(self.types) or \
+                not (self.run_dir / f"X2long_s{self.levels[0]:.2f}_j0.npy").exists():
+            return None
+        log.info("X2long: парный bootstrap (B = %d)...", self.B)
+        y, k = self.y, len(self.levels)
+        PL = [np.stack([self.load(f"X2long_s{s:.2f}_j{j}") for j in range(self.r)], 1) for s in self.levels]
+        EL = np.stack([((p - y[:, None]) ** 2).mean(1) for p in PL], 1)
+        RL = np.stack([(p - y[:, None]).mean(1) for p in PL], 1)
+        cols = [0] + [self.col_idx[(nt, s)] for nt in ("X1", "X2") for s in self.levels]
+        E_all = np.concatenate([self.E[:, cols], EL], 1)  # clean | X1 × k | X2 × k | X2long × k
+        R_all = np.concatenate([(self.P0[:, 0] - y)[:, None], RL], 1)  # clean | X2long × k
+        tpl = self.ctx.template[self.task]
+        texts = [t for t, keep in zip(self.ctx.texts, self.task) if keep]
+        n_long = np.array([sum(1 for m in LETTER_RE.finditer(t) if m.end() - m.start() >= MIN_TYPO_LEN)
+                           for t in texts])
+        ntok = self.ctx.n_tokens[self.task]
+        infos = {s: [self.info(f"X2long_s{s:.2f}_j{j}") for j in range(self.r)] for s in self.levels}
+        rows = []
+        for gname, m in (("все", np.ones(len(y), bool)), (TEMPLATE_LABEL, tpl), ("прочие описания", ~tpl)):
+            E, Rg = E_all[m], R_all[m]
+            ng = len(E)
+            rm, bm = [], []
+            for W in boot_weights(ng, self.B, SEED):
+                W = W.astype(np.float64)
+                rm.append(np.sqrt(W @ E / ng))
+                bm.append(W @ Rg / ng)
+            rm, bm = np.concatenate(rm), np.concatenate(bm)
+            M, BI = np.sqrt(E.mean(0)), Rg.mean(0)
+            share = n_long[m].sum() / ntok[m].sum()
+            for i, s in enumerate(self.levels):
+                a, b, c = 1 + i, 1 + k + i, 1 + 2 * k + i
+                inf = infos[s]
+                row = {"group": gname, "n": ng, "level": s, "long_share": share,
+                       # доля удалённых слов ≥ 3 букв (от слов ≥ 3 букв) и от всех слов группы
+                       "frac_changed_long": s if gname != "все" else
+                       sum(x["changed"] for x in inf) / max(sum(x["eligible"] for x in inf), 1),
+                       "frac_changed_all": s * share if gname != "все" else
+                       sum(x["changed"] for x in inf) / max(sum(x["words"] for x in inf), 1),
+                       "rmsle0": M[0], "rmsle_x1": M[a], "rmsle_x2": M[b], "rmsle_x2long": M[c],
+                       "delta_x1": M[0] - M[a], "delta_x2": M[0] - M[b], "delta_x2long": M[0] - M[c],
+                       **dict(zip(("delta_x2long_low", "delta_x2long_high"), pci(rm[:, 0] - rm[:, c]))),
+                       "diff_x1": M[a] - M[c], **dict(zip(("diff_x1_low", "diff_x1_high"), pci(rm[:, a] - rm[:, c]))),
+                       "diff_x2": M[b] - M[c], **dict(zip(("diff_x2_low", "diff_x2_high"), pci(rm[:, b] - rm[:, c]))),
+                       "bias0": BI[0], "bias_x2long": BI[1 + i],
+                       **dict(zip(("bias_x2long_low", "bias_x2long_high"), pci(bm[:, 1 + i])))}
+                row["sig_x1"] = bool(row["diff_x1_high"] < 0 or row["diff_x1_low"] > 0)
+                row["sig_x2"] = bool(row["diff_x2_high"] < 0 or row["diff_x2_low"] > 0)
+                rows.append({**row, "r": self.r, "B": self.B, "ci_method": "percentile (парный, внутри группы)"})
+        self.x2l = self.save(pd.DataFrame(rows), "x2_long")
+        return self.x2l
+
     # ------------------------------------------------------------ пропуски в train
     def missing_table(self) -> pd.DataFrame:
         """Доля пропусков (и OTHER) по признакам модели в train и в test без R2 (Уилсон)."""
@@ -1126,6 +1205,7 @@ class Report:
         self.curves()
         self.by_group()
         self.x1_vs_x2()
+        self.x2_long()
         self.missing_table()
         self.by_feature()
         self.bias()
