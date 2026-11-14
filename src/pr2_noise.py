@@ -21,6 +21,8 @@ Seed реализации j уровня k типа t: 42 + 1000·t + 100·k + j
 портится одна группа признаков): 42 + 100 000 + 1000·t + 10·g + j.
 Абляция desc_len у X2 (ревью 2026-11-14): удаление слов меняет и текст, и числовой desc_len; те же реализации
 (seed X2) прогоняются с чистым desc_len (X2text_*) и с чистым текстом (X2len_*) → desc_len.csv/png.
+Шаблон re-roof (третье ревью 2026-11-14): отдельная подгруппа в by_group и bias, квартили длины — без него;
+парное сравнение X1 и X2 → x1_vs_x2.csv.
 
 Статистика: M = RMSLE (меньше — лучше); ΔM(s) = M(0) − M(s) (отрицательное — ухудшение), R_rel = M(s)/M(0)
 (> 1 — ухудшение), R-AUC = 1/(s_max − s_min)·∫R(s)ds по трапециям с s₀ = 0 (меньше — лучше).
@@ -95,6 +97,10 @@ FEATURE_GROUPS = [
     ("Флаги (HL, TYPE_LAT_LON, EV)", ["HL", "TYPE_LAT_LON", "EV"]),
 ]
 
+# Шаблонное описание (ревью 2026-11-14 (3)): «Re-roof with Class A or B roof covering…» (80 токенов) — 0,5% train,
+# 18% val, 24% test без R2; эффект текстового и табличного шума сосредоточен на нём, поэтому — отдельная подгруппа
+TEMPLATE_PREFIX = "re-roof with class a or b roof covering"
+TEMPLATE_LABEL = "шаблон re-roof"
 LETTER_RE = re.compile(r"[A-Za-z]+")
 TOKEN_RE = re.compile(r"[a-z]+|\d+(?:\.\d+)?", re.IGNORECASE)  # как features.WORD_RE после lower()
 MIN_TYPO_LEN = 3
@@ -229,6 +235,7 @@ class Ctx:
         self.task = ~service_mask(np.expm1(self.y)) if EXCLUDE_SERVICE else np.ones(len(idx), bool)
         self.texts = self.df[TEXT_COL].tolist()
         self.n_tokens = np.array([len(TOKEN_RE.findall(t)) for t in self.texts], np.int32)
+        self.template = np.array([t.strip().lower().startswith(TEMPLATE_PREFIX) for t in self.texts], bool)
         # какие исходные столбцы портим
         self.num_cols = [c for c in prep.num_names if c in RAW_NUM]
         cats = []
@@ -590,9 +597,13 @@ class Report:
                                  "frac_changed_of_words": inf["changed"] / inf["words"] if "words" in inf else np.nan,
                                  "rmsle": float(st.rmsle(self.y, p)), "sec": inf["sec"]})
         runs = self.save(pd.DataFrame(rows), "noise_runs")
+        # доля выбранных значений, которые шум не изменил: у T1 — уже пустые ячейки, у T2 — совпавшая категория
+        runs["frac_selected_unchanged"] = 1 - runs["changed"] / runs["selected"].clip(lower=1)
+        self.save(runs, "noise_runs")
         g = runs.groupby(["type", "name", "modality", "level", "eligible_unit"], sort=False).agg(
             r=("j", "size"), n_units=("n_units", "first"), eligible=("eligible", "mean"),
             frac_selected=("frac_selected", "mean"),
+            frac_selected_unchanged=("frac_selected_unchanged", "mean"),
             frac_changed=("frac_changed", "mean"), frac_changed_of_words=("frac_changed_of_words", "mean"),
             rmsle_real_min=("rmsle", "min"), rmsle_real_max=("rmsle", "max"),
             rmsle_real_std=("rmsle", "std")).reset_index()
@@ -663,13 +674,18 @@ class Report:
         ctx, task = self.ctx, self.task
         out = [("PERMIT_TYPE", ctx.df["PERMIT_TYPE"].to_numpy(object)[task], None),
                ("Площадь", np.where(ctx.has_area[task], "есть площадь (> 0)", "нет площади"), None)]
+        tpl = ctx.template[task]
+        out.append(("Шаблон описания", np.where(tpl, TEMPLATE_LABEL, "прочие описания"), None))
+        # квартили длины — без шаблона: у 22% test ровно 80 токенов (шаблон), с ним «квартили» вырождаются
         ntok = ctx.n_tokens[task]
-        q = np.quantile(ntok, [0.25, 0.5, 0.75])
+        q = np.quantile(ntok[~tpl], [0.25, 0.5, 0.75])
         b = np.digitize(ntok, q, right=True)
         edges = [0] + [int(x) for x in q]
         labels = [f"Q1: ≤ {edges[1]} слов", f"Q2: {edges[1] + 1}–{edges[2]}", f"Q3: {edges[2] + 1}–{edges[3]}",
                   f"Q4: > {edges[3]}"]
-        out.append(("Длина описания (квартили)", np.array([labels[i] for i in b], object), ["X1", "X2"]))
+        lab = np.array([labels[i] for i in b], object)
+        lab[tpl] = ""  # шаблон — отдельная группа выше
+        out.append(("Длина описания (квартили, без шаблона)", lab, ["X1", "X2"]))
         wl = self.ctx.prep.word_len
         out.append(("Обрезка текста", np.where(ntok > wl, f"обрезан (> {wl} слов)", f"≤ {wl} слов"), ["X1", "X2"]))
         return out
@@ -680,6 +696,8 @@ class Report:
         rows = []
         for gname, lab, only in self.groupings():
             for g in sorted(pd.unique(lab)):
+                if g == "":
+                    continue
                 m = lab == g
                 E = self.E[m][:, cols]
                 rm = boot(E, self.B, SEED)["rmsle"]
@@ -730,16 +748,20 @@ class Report:
             el = sum(x["eligible"] for x in infos)
             rows.append({"type": nt, "name": TYPES[nt]["name"], "level": FEATURE_LEVEL, "group": gname,
                          "columns": infos[0]["units"] if gname != "Все признаки типа" else "все",
+                         "n_units": len(infos[0]["units"]),
                          "frac_changed": sum(x["changed"] for x in infos) / max(el, 1),
                          "rmsle": M[i], **dict(zip(("rmsle_low", "rmsle_high"), pci(rm[:, i]))),
                          "delta": M[0] - M[i], "delta_low": lo, "delta_high": hi,
                          "significant": bool(hi < 0 or lo > 0), "r_rel": M[i] / M[0], "r": self.r, "B": self.B,
                          "ci_method": "percentile (парный)"})
         df = pd.DataFrame(rows)
-        # ΔM в расчёте на фактически изменённую долю: у групп разная заполненность (площадь есть у ~27% строк),
-        # поэтому рейтинг по ΔM при одном s, как и сравнение типов, зависит от шкалы
-        for a, b in (("", ""), ("_low", "_low"), ("_high", "_high")):
-            df[f"delta_per_changed{a}"] = df[f"delta{b}"] / df["frac_changed"]
+        # ΔM на одно фактически изменённое значение в строке: у групп разная заполненность (площадь есть у ~27% строк)
+        # и разное число столбцов (1–4), поэтому рейтинг по ΔM при одном s, как и сравнение типов, зависит от шкалы.
+        # changed_per_row = доля изменённых ячеек группы × число единиц шума (ревью 2026-11-14 (3): прежде делили
+        # только на долю, и группы из 2–4 столбцов выглядели вреднее в n_units раз)
+        df["changed_per_row"] = df["frac_changed"] * df["n_units"]
+        for a in ("", "_low", "_high"):
+            df[f"delta_per_changed{a}"] = df[f"delta{a}"] / df["changed_per_row"]
         # минимальная доля пропусков в train среди признаков модели группы: 0 — эмбеддинг «пропуск» не обучался
         tm = []
         for g in df["group"]:
@@ -884,6 +906,8 @@ class Report:
         groups = [("Все", "все", np.ones(len(y), bool), None)]
         groups += [("Квартиль VALUATION", qlab[k], yq == k, None) for k in range(4)]
         groups += [("Обрезка текста", f"обрезан (> {wl} слов)", ntok > wl, ["X1", "X2"])]
+        tpl = self.ctx.template[self.task]
+        groups += [("Шаблон описания", TEMPLATE_LABEL, tpl, None), ("Шаблон описания", "прочие описания", ~tpl, None)]
         return groups, qlab
 
     def bias(self) -> pd.DataFrame:
@@ -1028,6 +1052,45 @@ class Report:
         self.savefig(fig, "desc_len")
         return self.ablation
 
+    # ------------------------------------------------------------ X1 против X2 (парно)
+    def x1_vs_x2(self) -> pd.DataFrame | None:
+        """Парное сравнение опечаток и удаления слов при одном s: diff = M(X1) − M(X2) (> 0 — опечатки вреднее);
+        в целом, на шаблоне и на прочих описаниях; одни и те же перевыборки для обоих типов."""
+        if not {"X1", "X2"} <= set(self.types):
+            return None
+        tpl = self.ctx.template[self.task]
+        cols = [0] + [self.col_idx[(nt, s)] for nt in ("X1", "X2") for s in self.levels]
+        k = len(self.levels)
+        # доля слов, доступных опечатке (≥ 3 букв), среди всех токенов группы — для сравнения по изменённым словам
+        texts = [t for t, keep in zip(self.ctx.texts, self.task) if keep]
+        n_elig = np.array([sum(1 for m in LETTER_RE.finditer(t) if m.end() - m.start() >= MIN_TYPO_LEN)
+                           for t in texts])
+        ntok = self.ctx.n_tokens[self.task]
+        unchanged = self.grid[self.grid["type"] == "X1"].set_index("level")["frac_selected_unchanged"]
+        rows = []
+        for gname, m in (("все", np.ones(len(self.y), bool)), (TEMPLATE_LABEL, tpl), ("прочие описания", ~tpl)):
+            E = self.E[m][:, cols]
+            rm = boot(E, self.B, SEED)["rmsle"]
+            M = np.sqrt(E.mean(0))
+            share = n_elig[m].sum() / ntok[m].sum()
+            d2 = np.r_[0.0, M[0] - M[1 + k:]]  # ΔM X2 по уровням, s₀ = 0 (у X2 доля изменённых слов = s)
+            for i, s in enumerate(self.levels):
+                a, b = 1 + i, 1 + k + i
+                lo, hi = pci(rm[:, a] - rm[:, b])
+                # оценка: доля изменённых слов у X1 ≈ s · (1 − доля неизменивших) · доля слов ≥ 3 букв в группе;
+                # ΔM X2 при той же доле удалённых слов — линейная интерполяция кривой X2 группы
+                fw = s * (1 - unchanged.loc[s]) * share
+                rows.append({"group": gname, "n": int(m.sum()), "level": s, "rmsle0": M[0],
+                             "rmsle_x1": M[a], "rmsle_x2": M[b], "delta_x1": M[0] - M[a], "delta_x2": M[0] - M[b],
+                             "diff": M[a] - M[b], "diff_low": lo, "diff_high": hi,
+                             "significant": bool(hi < 0 or lo > 0),
+                             "x1_eligible_share": share, "x1_frac_changed_of_words": fw,
+                             "delta_x2_at_x1_words": float(np.interp(fw, [0.0] + self.levels, d2)),
+                             "B": self.B, "ci_method": "percentile (парный, внутри группы); "
+                                                       "delta_x2_at_x1_words — интерполяция, без CI"})
+        self.x12 = self.save(pd.DataFrame(rows), "x1_vs_x2")
+        return self.x12
+
     # ------------------------------------------------------------ пропуски в train
     def missing_table(self) -> pd.DataFrame:
         """Доля пропусков (и OTHER) по признакам модели в train и в test без R2 (Уилсон)."""
@@ -1053,6 +1116,7 @@ class Report:
         self.noise_grid()
         self.curves()
         self.by_group()
+        self.x1_vs_x2()
         self.missing_table()
         self.by_feature()
         self.bias()
