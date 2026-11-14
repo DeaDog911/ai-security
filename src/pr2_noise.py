@@ -59,10 +59,10 @@ PRACTICAL = 0.02      # ΔRMSLE, которую в экспериментах с
 SEED_SPREAD = 0.01    # разброс RMSLE между seed обучения
 
 TYPES = {
-    "T1": {"t": 1, "modality": "таблица", "name": "Пропуски (MCAR)", "kind": "tab", "natural": 0.237,
-           "natural_label": "ПР1: 23,7% пропусков"},
-    "T2": {"t": 2, "modality": "таблица", "name": "Порча категорий", "kind": "tab", "natural": 0.234,
-           "natural_label": "ПР1: 23,4% переименованных CNC"},
+    # Естественный уровень по ПР1 на кривых не отмечается (ревью 2026-11-14): чистый test уже содержит естественные
+    # пропуски (s у T1 — пропуски сверх них), а 23,4% переименованных CNC — один столбец и в модели → OTHER.
+    "T1": {"t": 1, "modality": "таблица", "name": "Пропуски (MCAR)", "kind": "tab"},
+    "T2": {"t": 2, "modality": "таблица", "name": "Порча категорий", "kind": "tab"},
     "X1": {"t": 3, "modality": "текст", "name": "Опечатки", "kind": "text"},
     "X2": {"t": 4, "modality": "текст", "name": "Удаление слов", "kind": "text"},
 }
@@ -721,10 +721,6 @@ class Report:
                     last = d.iloc[-1]
                     ax.annotate(nt, (last["level"], last[ycol]), xytext=(6, 0), textcoords="offset points",
                                 va="center", fontsize=9, color="#333333")
-                    if "natural" in TYPES[nt]:
-                        ax.axvline(TYPES[nt]["natural"], color=COLORS[nt], ls=":", lw=1.2)
-                        ax.text(TYPES[nt]["natural"], 0.02 if nt == "T1" else 0.10, " " + TYPES[nt]["natural_label"],
-                                transform=ax.get_xaxis_transform(), fontsize=7.5, color="#555555")
                 ax.axhline(ref, color="#888888", lw=1, ls="--", label="чистый test" if ycol == "rmsle" else "R_rel = 1")
                 ax.set(title=f"Модальность: {mod}", xlabel="интенсивность s (доля затронутых значений)",
                        xlim=(-0.01, max(self.levels) + 0.06))
