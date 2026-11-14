@@ -19,6 +19,8 @@ test до препроцессора, дальше — обычный transform 
     X2  текст    удаление слов: каждое слово (токен модели: буквы или число) удаляется
 Seed реализации j уровня k типа t: 42 + 1000·t + 100·k + j (k = 10·s). Профиль по признакам (T1, T2 при s = 0,3,
 портится одна группа признаков): 42 + 100 000 + 1000·t + 10·g + j.
+Абляция desc_len у X2 (ревью 2026-11-14): удаление слов меняет и текст, и числовой desc_len; те же реализации
+(seed X2) прогоняются с чистым desc_len (X2text_*) и с чистым текстом (X2len_*) → desc_len.csv/png.
 
 Статистика: M = RMSLE (меньше — лучше); ΔM(s) = M(0) − M(s) (отрицательное — ухудшение), R_rel = M(s)/M(0)
 (> 1 — ухудшение), R-AUC = 1/(s_max − s_min)·∫R(s)ds по трапециям с s₀ = 0 (меньше — лучше).
@@ -66,6 +68,7 @@ TYPES = {
     "X1": {"t": 3, "modality": "текст", "name": "Опечатки", "kind": "text"},
     "X2": {"t": 4, "modality": "текст", "name": "Удаление слов", "kind": "text"},
 }
+ABLATION = {"text": "только текст (desc_len чистый)", "len": "только desc_len (текст чистый)"}  # X2
 ELIGIBLE = {"T1": "все ячейки затрагиваемых признаков", "T2": "непустые категории",
             "X1": "слова из ≥ 3 букв", "X2": "все слова (токены модели)"}
 COLORS = {"T1": "#2a78d6", "T2": "#eb6834", "X1": "#1baf7a", "X2": "#eda100"}  # dataviz: слоты 1–4
@@ -140,7 +143,7 @@ def typo_texts(texts: list[str], p: float, rng: np.random.Generator):
         if not runs:
             out.append(t)
             continue
-        u = rng.random((len(runs), 4))  # расход случайных чисел не зависит от p
+        u = rng.random((len(runs), 4))  # 4 числа на слово: выбор (< p), операция, позиция, буква
         hit = u[:, 0] < p
         if not hit.any():
             out.append(t)
@@ -205,6 +208,7 @@ class Run:
     seed: int
     group: str | None = None
     units: list[tuple[str, ...]] = field(default_factory=list)  # для T1/T2
+    variant: str | None = None  # абляция desc_len у X2: "text" — desc_len чистый, "len" — текст чистый
 
 
 class Ctx:
@@ -244,6 +248,19 @@ class Ctx:
             vc = tr[c].value_counts().sort_index()
             self.train_dist[c] = (vc.index.to_numpy(object), (vc / vc.sum()).to_numpy(float))
         self.has_area = (self.df["square_footage"].fillna(0).to_numpy() > 0)
+        # доля пропусков (и OTHER) по признакам модели в train — T1 на столбце, который в train всегда заполнен,
+        # подаёт эмбеддинг «пропуск», не обученный ни на одном примере
+        tr_rows = df["split"].to_numpy() == "train"
+        self.n_train = int(tr_rows.sum())
+        self.train_missing = {c: int(np.count_nonzero(X["cat"][tr_rows, i] == 0))
+                              for i, c in enumerate(prep.cat_names)}
+        self.train_missing.update({c: int(np.count_nonzero(X["num_mask"][tr_rows, i]))
+                                   for i, c in enumerate(prep.num_names)})
+        self.train_other = {c: int(np.count_nonzero(X["cat"][tr_rows, i] == 1)) for i, c in enumerate(prep.cat_names)}
+        self.test_missing = {c: int(np.count_nonzero(self.X["cat"][self.task, i] == 0))
+                             for i, c in enumerate(prep.cat_names)}
+        self.test_missing.update({c: int(np.count_nonzero(self.X["num_mask"][self.task, i]))
+                                  for i, c in enumerate(prep.num_names)})
         self.device = get_device(device_arg)
         self._model = None
 
@@ -299,13 +316,18 @@ class Ctx:
         return df, {"eligible": int(elig[task].sum()), "selected": int(sel[task].sum()),
                     "changed": int(ch[task].sum()), "words": int(self.n_tokens[task].sum())}
 
-    def featurize(self, df: pd.DataFrame, kind: str) -> dict[str, np.ndarray]:
-        """Признаки искажённого test; не затронутые шумом части берутся из чистых признаков."""
+    def featurize(self, df: pd.DataFrame, kind: str, variant: str | None = None) -> dict[str, np.ndarray]:
+        """Признаки искажённого test; не затронутые шумом части берутся из чистых признаков.
+
+        У текстового шума меняются и текст (TF-IDF→SVD, слова-токены), и числовой desc_len (длина строки).
+        Абляция: variant="text" — desc_len чистый (меняется только текст), "len" — текст чистый (меняется только
+        desc_len)."""
         X = dict(self.X)
-        X["num"], X["num_mask"] = self.prep.transform_num(df)  # у текста — desc_len
+        if variant != "text":
+            X["num"], X["num_mask"] = self.prep.transform_num(df)  # у текста — desc_len
         if kind == "tab":
             X["cat"] = self.prep.transform_cat(df)
-        else:
+        elif variant != "len":
             X["txt"] = self.prep.transform_txt(df)
             X["words"] = self.prep.transform_words(df)
         return X
@@ -324,7 +346,7 @@ class Ctx:
 
 
 # ====================================================================== прогоны и кеш
-def plan_runs(ctx: Ctx, types, levels, r, features: bool) -> list[Run]:
+def plan_runs(ctx: Ctx, types, levels, r, features: bool, ablation: bool = True) -> list[Run]:
     runs = []
     for nt in types:
         t = TYPES[nt]["t"]
@@ -333,6 +355,14 @@ def plan_runs(ctx: Ctx, types, levels, r, features: bool) -> list[Run]:
             k = int(round(s * 10))
             for j in range(r):
                 runs.append(Run(f"{nt}_s{s:.2f}_j{j}", nt, s, j, SEED + 1000 * t + 100 * k + j, None, units))
+    if ablation and "X2" in types:  # те же seed, что у X2: та же реализация удаления слов, парное сравнение
+        t = TYPES["X2"]["t"]
+        for variant in ABLATION:
+            for s in levels:
+                k = int(round(s * 10))
+                for j in range(r):
+                    runs.append(Run(f"X2{variant}_s{s:.2f}_j{j}", "X2", s, j, SEED + 1000 * t + 100 * k + j,
+                                    variant=variant))
     if features:
         for nt in [x for x in types if TYPES[x]["kind"] == "tab"]:
             t = TYPES[nt]["t"]
@@ -367,7 +397,8 @@ def check_cache(run_dir, meta: dict, force: bool) -> None:
 
 def save_run(run_dir, run: Run, pred: np.ndarray, stats: dict, sec: float) -> None:
     info = {"key": run.key, "type": run.ntype, "level": run.level, "j": run.j, "seed": run.seed,
-            "group": run.group, "units": ["+".join(u) for u in run.units], "sec": round(sec, 1), **stats}
+            "group": run.group, "units": ["+".join(u) for u in run.units], "variant": run.variant,
+            "sec": round(sec, 1), **stats}
     np.save(run_dir / f"{run.key}.npy", pred.astype(np.float32))
     (run_dir / f"{run.key}.json").write_text(json.dumps(info, ensure_ascii=False), encoding="utf-8")
 
@@ -379,10 +410,11 @@ def self_checks(ctx: Ctx, smoke: bool) -> np.ndarray:
         df, stats = ctx.apply(run)
         if stats["changed"] != 0:
             raise AssertionError(f"{nt}: при s = 0 изменено {stats['changed']} значений")
-        X = ctx.featurize(df, spec["kind"])
-        bad = [k for k in X if not np.array_equal(X[k], ctx.X[k])]
-        if bad:
-            raise AssertionError(f"{nt}: при s = 0 признаки {bad} не совпали с features.npz")
+        for variant in ([None] + list(ABLATION)) if nt == "X2" else [None]:
+            X = ctx.featurize(df, spec["kind"], variant)
+            bad = [k for k in X if not np.array_equal(X[k], ctx.X[k])]
+            if bad:
+                raise AssertionError(f"{nt} ({variant}): при s = 0 признаки {bad} не совпали с features.npz")
     log.info("проверка: s = 0 по всем типам — признаки совпали с features.npz бит-в-бит")
     for nt, spec in TYPES.items():  # воспроизводимость реализации шума
         run = Run("check", nt, 0.3, 0, SEED + 7, None, ctx.units(ntype=nt) if spec["kind"] == "tab" else [])
@@ -416,7 +448,7 @@ def run_all(ctx: Ctx, runs: list[Run], run_dir) -> None:
     for i, run in enumerate(todo, start=1):
         t0 = time.perf_counter()
         df, stats = ctx.apply(run)
-        X = ctx.featurize(df, TYPES[run.ntype]["kind"])
+        X = ctx.featurize(df, TYPES[run.ntype]["kind"], run.variant)
         pred = ctx.predict(X)
         sec = time.perf_counter() - t0
         save_run(run_dir, run, pred, stats, sec)
@@ -551,13 +583,16 @@ class Report:
                     p = self.load(inf["key"])
                     rows.append({"type": nt, "name": TYPES[nt]["name"], "modality": TYPES[nt]["modality"],
                                  "level": s, "j": j, "seed": inf["seed"], "eligible_unit": ELIGIBLE[nt],
+                                 # T1/T2: число портящихся единиц на строку (у T1 пара lat/lon — одна единица)
+                                 "n_units": len(inf["units"]) if TYPES[nt]["kind"] == "tab" else np.nan,
                                  "eligible": inf["eligible"], "selected": inf["selected"], "changed": inf["changed"],
                                  "frac_selected": inf["selected"] / e, "frac_changed": inf["changed"] / e,
                                  "frac_changed_of_words": inf["changed"] / inf["words"] if "words" in inf else np.nan,
                                  "rmsle": float(st.rmsle(self.y, p)), "sec": inf["sec"]})
         runs = self.save(pd.DataFrame(rows), "noise_runs")
         g = runs.groupby(["type", "name", "modality", "level", "eligible_unit"], sort=False).agg(
-            r=("j", "size"), eligible=("eligible", "mean"), frac_selected=("frac_selected", "mean"),
+            r=("j", "size"), n_units=("n_units", "first"), eligible=("eligible", "mean"),
+            frac_selected=("frac_selected", "mean"),
             frac_changed=("frac_changed", "mean"), frac_changed_of_words=("frac_changed_of_words", "mean"),
             rmsle_real_min=("rmsle", "min"), rmsle_real_max=("rmsle", "max"),
             rmsle_real_std=("rmsle", "std")).reset_index()
@@ -701,7 +736,21 @@ class Report:
                          "significant": bool(hi < 0 or lo > 0), "r_rel": M[i] / M[0], "r": self.r, "B": self.B,
                          "ci_method": "percentile (парный)"})
         df = pd.DataFrame(rows)
+        # ΔM в расчёте на фактически изменённую долю: у групп разная заполненность (площадь есть у ~27% строк),
+        # поэтому рейтинг по ΔM при одном s, как и сравнение типов, зависит от шкалы
+        for a, b in (("", ""), ("_low", "_low"), ("_high", "_high")):
+            df[f"delta_per_changed{a}"] = df[f"delta{b}"] / df["frac_changed"]
+        # минимальная доля пропусков в train среди признаков модели группы: 0 — эмбеддинг «пропуск» не обучался
+        tm = []
+        for g in df["group"]:
+            cols = dict(FEATURE_GROUPS).get(g)
+            feats = [f for c in (cols or []) for f in [c] + [d for d, src in DERIVED_CAT.items() if src == c]
+                     if f in self.ctx.train_missing]
+            tm.append(min(self.ctx.train_missing[f] for f in feats) / self.ctx.n_train if feats else np.nan)
+        df["train_missing_min"] = tm
         df["rank"] = df[df["group"] != "Все признаки типа"].groupby("type")["delta"].rank(method="min")
+        df["rank_per_changed"] = (df[df["group"] != "Все признаки типа"].groupby("type")["delta_per_changed"]
+                                  .rank(method="min"))
         self.feat = self.save(df.sort_values(["type", "delta"]).reset_index(drop=True), "by_feature")
         return self.feat
 
@@ -822,12 +871,9 @@ class Report:
         (self.out / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     # ------------------------------------------------------------ сдвиг прогноза
-    def bias(self) -> pd.DataFrame:
-        """Средний остаток (прогноз − факт, log1p; > 0 — завышение) по уровням шума: в целом, по квартилям цели
-        и для обрезанных описаний. Объясняет расхождение RMSLE и MdAPE: шум, сдвигающий прогноз вниз, частично
-        компенсирует завышение baseline на мелких разрешениях."""
+    def bias_groups(self):
+        """Группы для разбора сдвига: все, квартили VALUATION (test без R2), обрезанные описания."""
         y = self.y
-        res = np.stack([(p - y[:, None]).mean(1) for p in self.P], 1)  # (n, K): средний остаток по реализациям
         q = np.quantile(y, [0.25, 0.5, 0.75])
         yq = np.digitize(y, q, right=True)
         money = np.round(np.expm1(q)).astype(int)
@@ -838,6 +884,15 @@ class Report:
         groups = [("Все", "все", np.ones(len(y), bool), None)]
         groups += [("Квартиль VALUATION", qlab[k], yq == k, None) for k in range(4)]
         groups += [("Обрезка текста", f"обрезан (> {wl} слов)", ntok > wl, ["X1", "X2"])]
+        return groups, qlab
+
+    def bias(self) -> pd.DataFrame:
+        """Средний остаток (прогноз − факт, log1p; > 0 — завышение) по уровням шума: в целом, по квартилям цели
+        и для обрезанных описаний. Объясняет расхождение RMSLE и MdAPE: шум, сдвигающий прогноз вниз, частично
+        компенсирует завышение baseline на мелких разрешениях."""
+        y = self.y
+        res = np.stack([(p - y[:, None]).mean(1) for p in self.P], 1)  # (n, K): средний остаток по реализациям
+        groups, qlab = self.bias_groups()
         rows = []
         for gname, glab, m, only in groups:
             Rg, Eg = res[m], self.E[m]
@@ -886,14 +941,122 @@ class Report:
         self.savefig(fig, "bias_curves")
         return self.bias_df
 
+    # ------------------------------------------------------------ абляция desc_len у X2
+    def desc_len_ablation(self) -> pd.DataFrame | None:
+        """X2 меняет и текст, и числовой desc_len (длину строки). Те же реализации удаления слов прогоняются ещё
+        дважды: с чистым desc_len (путь текста) и с чистым текстом (путь desc_len). Парный bootstrap с clean
+        и полным X2 — внутри каждой группы bias_groups()."""
+        if "X2" not in self.types or not (self.run_dir / f"X2text_s{self.levels[0]:.2f}_j0.npy").exists():
+            return None
+        log.info("абляция desc_len у X2: парный bootstrap (B = %d)...", self.B)
+        y = self.y
+        variants = [("full", "X2: текст и desc_len", "X2")] + \
+                   [(v, f"X2: {name}", f"X2{v}") for v, name in ABLATION.items()]
+        P, cols = [self.P0], [("clean", 0.0)]
+        for s in self.levels:
+            for v, _, prefix in variants:
+                P.append(self.P[self.col_idx[("X2", s)]] if v == "full" else
+                         np.stack([self.load(f"{prefix}_s{s:.2f}_j{j}") for j in range(self.r)], 1))
+                cols.append((v, s))
+        idx = {c: i for i, c in enumerate(cols)}
+        E = np.stack([((p - y[:, None]) ** 2).mean(1) for p in P], 1)
+        R = np.stack([(p - y[:, None]).mean(1) for p in P], 1)
+        yv = np.expm1(y)[:, None]
+        APE = [np.abs(np.expm1(p) - yv) / yv for p in P]
+        MD = np.array([100 * np.median(a) for a in APE])
+        md_b = boot(E, self.B, SEED, None, APE)["mdape"]  # те же перевыборки, что ниже у группы «Все»
+        groups, _ = self.bias_groups()
+        rows = []
+        for gname, glab, m, _ in groups:
+            Eg, Rg = E[m], R[m]
+            ng = len(Eg)
+            rm, bm = [], []
+            for W in boot_weights(ng, self.B, SEED):
+                W = W.astype(np.float64)
+                rm.append(np.sqrt(W @ Eg / ng))
+                bm.append(W @ Rg / ng)
+            rm, bm = np.concatenate(rm), np.concatenate(bm)
+            M, BI = np.sqrt(Eg.mean(0)), Rg.mean(0)
+            for s in self.levels:
+                full = idx[("full", s)]
+                for v, vname, _ in variants:
+                    c = idx[(v, s)]
+                    row = {"variant": v, "name": vname, "level": s, "grouping": gname, "group": glab, "n": ng,
+                           "rmsle0": M[0], "rmsle": M[c], **dict(zip(("rmsle_low", "rmsle_high"), pci(rm[:, c]))),
+                           "delta": M[0] - M[c],
+                           **dict(zip(("delta_low", "delta_high"), pci(rm[:, 0] - rm[:, c]))),
+                           "bias0": BI[0], "bias": BI[c], **dict(zip(("bias_low", "bias_high"), pci(bm[:, c]))),
+                           "delta_bias": BI[c] - BI[0],
+                           **dict(zip(("delta_bias_low", "delta_bias_high"), pci(bm[:, c] - bm[:, 0])))}
+                    if gname == "Все":
+                        # доля эффекта полного X2, которая получается по одному пути (у full = 1)
+                        row.update({
+                            "share_delta": (M[0] - M[c]) / (M[0] - M[full]),
+                            **dict(zip(("share_delta_low", "share_delta_high"),
+                                       pci((rm[:, 0] - rm[:, c]) / (rm[:, 0] - rm[:, full])))),
+                            "share_delta_bias": (BI[c] - BI[0]) / (BI[full] - BI[0]),
+                            **dict(zip(("share_delta_bias_low", "share_delta_bias_high"),
+                                       pci((bm[:, c] - bm[:, 0]) / (bm[:, full] - bm[:, 0])))),
+                            "mdape0": MD[0], "mdape": MD[c], **dict(zip(("mdape_low", "mdape_high"), pci(md_b[:, c]))),
+                            "delta_mdape": MD[0] - MD[c],
+                            **dict(zip(("delta_mdape_low", "delta_mdape_high"), pci(md_b[:, 0] - md_b[:, c])))})
+                    rows.append({**row, "r": self.r, "B": self.B, "ci_method": "percentile (парный, внутри группы)"})
+        self.ablation = self.save(pd.DataFrame(rows), "desc_len")
+
+        d = self.ablation[self.ablation["grouping"] == "Все"]
+        colors = {"full": COLORS["X2"], "text": "#7b52c7", "len": "#5f6b77"}
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+        for v, vname, _ in variants:
+            x = d[d["variant"] == v]
+            lv = np.r_[0.0, x["level"]]
+            for ax, col, base in ((axes[0], "bias", "bias0"), (axes[1], "delta", None)):
+                yy = np.r_[x[base].iloc[0] if base else 0.0, x[col]]
+                lo = np.r_[yy[0], x[f"{col}_low"]]
+                hi = np.r_[yy[0], x[f"{col}_high"]]
+                ax.fill_between(lv, lo, hi, color=colors[v], alpha=0.2, lw=0)
+                ax.plot(lv, yy, color=colors[v], marker="D" if v == "full" else "o", ms=5, lw=2, label=vname)
+        axes[0].axhline(0, color="#888888", lw=1)
+        axes[0].set(title="Средний остаток прогноза (> 0 — завышение)", xlabel="доля удалённых слов s",
+                    ylabel="mean(прогноз − факт), log1p")
+        axes[1].axhline(0, color="#888888", lw=1)
+        axes[1].set(title="ΔM = M(0) − M(s) (< 0 — хуже)", xlabel="доля удалённых слов s", ylabel="ΔRMSLE")
+        for ax in axes:
+            ax.grid(alpha=0.25, lw=0.6)
+            ax.legend(fontsize=8)
+        fig.suptitle(f"X2: путь текста и путь desc_len (те же реализации удаления, r = {self.r}; "
+                     f"коридор — 95% CI, парный bootstrap, B = {self.B})", fontsize=10)
+        self.savefig(fig, "desc_len")
+        return self.ablation
+
+    # ------------------------------------------------------------ пропуски в train
+    def missing_table(self) -> pd.DataFrame:
+        """Доля пропусков (и OTHER) по признакам модели в train и в test без R2 (Уилсон)."""
+        ctx = self.ctx
+        hit = {x for u in ctx.units(ntype="T1") for x in u}
+        hit |= {d for d, src in DERIVED_CAT.items() if src in hit}
+        n_test = int(self.task.sum())
+        rows = []
+        for c in ctx.prep.cat_names + ctx.prep.num_names:
+            w, wt = st.wilson_ci(ctx.train_missing[c], ctx.n_train), st.wilson_ci(ctx.test_missing[c], n_test)
+            rows.append({"feature": c, "kind": "категория" if c in ctx.prep.cat_names else "число",
+                         "t1_corrupted": c in hit, "train_missing_n": ctx.train_missing[c],
+                         "train_missing": w.estimate, "train_missing_low": w.low, "train_missing_high": w.high,
+                         "train_other_n": ctx.train_other.get(c, np.nan), "n_train": ctx.n_train,
+                         "test_missing": wt.estimate, "test_missing_low": wt.low, "test_missing_high": wt.high,
+                         "n_test": n_test, "ci_method": "wilson"})
+        self.missing = self.save(pd.DataFrame(rows), "missing_train")
+        return self.missing
+
     def run(self) -> None:
         self.collect()
         ev = self.baseline()
         self.noise_grid()
         self.curves()
         self.by_group()
+        self.missing_table()
         self.by_feature()
         self.bias()
+        self.desc_len_ablation()
         self.plot_curves()
         self.plot_groups()
         self.plot_features()
@@ -911,6 +1074,7 @@ def main() -> None:
     ap.add_argument("--report", action="store_true", help="только отчёт по готовому кешу")
     ap.add_argument("--force", action="store_true", help="удалить кеш прогонов и посчитать заново")
     ap.add_argument("--no-features", action="store_true", help="без профиля по признакам")
+    ap.add_argument("--no-ablation", action="store_true", help="без абляции desc_len у X2")
     ap.add_argument("--device", default=None)
     args = ap.parse_args()
 
@@ -928,7 +1092,7 @@ def main() -> None:
              len(ctx.idx), int(ctx.task.sum()), device_name(ctx.device), types, levels, r, B)
     log.info("T1 портит: %s; T2 — категории: %s", [("+".join(u)) for u in ctx.units(ntype="T1")], ctx.cat_cols)
     check_cache(run_dir, cache_meta(ctx, args.smoke), args.force and not args.report)
-    runs = plan_runs(ctx, types, levels, r, not args.no_features)
+    runs = plan_runs(ctx, types, levels, r, not args.no_features, not args.no_ablation)
     if not args.report:
         pred0 = self_checks(ctx, args.smoke)
         if not (run_dir / "clean.npy").exists():

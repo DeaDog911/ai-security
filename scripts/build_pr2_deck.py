@@ -71,6 +71,13 @@ class Data:
         self.group = csv("by_group")
         self.feat = csv("by_feature")
         self.bias = csv("bias")
+        self.desc_len = csv("desc_len")
+
+    def abl(self, variant: str, s: float, group: str = "все") -> pd.Series:
+        a = self.desc_len
+        rows = a[(a["variant"] == variant) & (a["level"].round(3) == round(s, 3)) & (a["group"] == group)]
+        assert len(rows) == 1, (variant, s, group)
+        return rows.iloc[0]
 
     def point(self, t: str, s: float) -> pd.Series:
         c = self.curves
@@ -381,18 +388,22 @@ def s09_features(prs, d: Data, tmp: Path) -> None:
     header(s, "Вклад признаков", None, f"9 / {N_MAIN}")
     text_box(s, 0.45, 1.12, 12.4, 0.4, [
         "При s = 0,3 портится **одна группа признаков**, остальное чистое; серым — порча всех признаков типа"], size=13)
-    picture(s, REP / "by_feature.png", 0.45, 1.55, 12.4, 4.25)
+    picture(s, REP / "by_feature.png", 0.45, 1.5, 12.4, 3.95)
     a, b, c = d.ft("T1", "Подтип и назначение"), d.ft("T1", "Площадь"), d.ft("T2", "Business Unit")
     geo = d.ft("T1", "Районы (CD, CNC, CPA, APC)")
     co = d.ft("T1", "Координаты")
-    text_box(s, 0.45, 5.85, 12.4, 1.15, [
+    ratio = b["delta_per_changed"] / a["delta_per_changed"]
+    text_box(s, 0.45, 5.5, 12.4, 1.55, [
         (f"Пропуски: сильнее всего — подтип и назначение {sg(a['delta'], 4)} {ci(a['delta_low'], a['delta_high'], 4)}"
          f" и площадь {sg(b['delta'], 4)} {ci(b['delta_low'], b['delta_high'], 4)}; порча категорий — "
          f"Business Unit {sg(c['delta'], 4)} {ci(c['delta_low'], c['delta_high'], 4)}.", {"bullet": True}),
+        (f"Площадь заполнена у меньшинства разрешений: в расчёте на стёртое значение она вреднее подтипа "
+         f"в {num(ratio, 1)} раза. Подтип и Business Unit в обучении всегда заполнены — их пропуск модель видит "
+         "впервые.", {"bullet": True}),
         (f"География почти не важна: координаты {sg(co['delta'], 4)} {ci(co['delta_low'], co['delta_high'], 4)}, "
          f"районы {sg(geo['delta'], 4)} {ci(geo['delta_low'], geo['delta_high'], 4)}. ΔM и 95% CI — парный "
          f"bootstrap percentile, B = {d.B}, r = {d.r}.", {"bullet": True}),
-    ], size=12, space=4)
+    ], size=12, space=3)
 
 
 def s10_bias(prs, d: Data, tmp: Path) -> None:
@@ -416,13 +427,16 @@ def s10_bias(prs, d: Data, tmp: Path) -> None:
     mtable(s, 6.2, 1.2, 6.7, rows, [1.55, 1.05, 1.03, 1.03, 1.03, 1.03], size=12, row_h=0.6, head_size=10.5,
            sub_size=9.5, bold_first_col=True)
     tr0 = d.grp("X2", 0.4, "Обрезка текста", "обрезан (> 96 слов)")
-    text_box(s, 0.45, 5.4, 12.45, 1.6, [
+    tx = d.abl("text", sm)
+    text_box(s, 0.45, 5.35, 12.45, 1.75, [
         ("Baseline прижимает прогноз к среднему: дешёвые работы завышает, дорогие занижает. Табличный шум это "
          "усиливает — меньше информации, прогноз ближе к среднему.", {"bullet": True}),
         ("Удаление слов сдвигает все прогнозы вниз и частично гасит завышение: отсюда «улучшение» MdAPE и RMSLE на "
          f"обрезанных описаниях (ΔM {sg(tr0['delta'], 3)} {ci(tr0['delta_low'], tr0['delta_high'], 3)} при s = 0,4) — "
          "компенсация смещения, а не устойчивость. Вывод делаем по RMSLE.", {"bullet": True}),
-    ], size=12, space=5)
+        (f"Сдвиг идёт через сам текст, а не через длину описания: при неизменной длине остаётся "
+         f"{num(100 * tx['share_delta_bias'], 0)}% сдвига (s = {lvl(sm)}).", {"bullet": True}),
+    ], size=12, space=4)
     note(s, 6.2, 4.85, 6.7, 0.5, f"Таблица — средний остаток и 95% CI (парный percentile bootstrap внутри группы, "
                                  f"B = {d.B}); квартили стоимости test.")
 
@@ -445,7 +459,8 @@ def s11_conclusions(prs, d: Data) -> None:
         ("Ограничения", [
             "Числовые признаки испорчены только пропусками: шум измерений и округление не исследовались.",
             "Шум MCAR и равновероятные опечатки — упрощение: реальные пропуски структурные, опечатки неравномерны.",
-            "Клиппинг, OTHER и эмбеддинг «пропуск» — часть модели; их сглаживание входит в оценку.",
+            "Клиппинг, OTHER и эмбеддинг «пропуск» — часть модели; пропуск подтипа и Business Unit в обучении "
+            "не встречался.",
             "Шкала s у типов разная (ячейки против слов): порядок типов, кроме первого места пропусков, зависит "
             "от шкалы.",
             "Профиль признаков и подгруппы — при одном-двух уровнях; только один период (test).",
